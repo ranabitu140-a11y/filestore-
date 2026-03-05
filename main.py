@@ -284,7 +284,7 @@ async def deliver_content(client, message, url_hash, target_chat_id):
         except FloodWait as e:
             await asyncio.sleep(e.value)
         except Exception as e:
-            await status_msg.reply_text(f"❌ Error sending file. Ensure bot is admin. Process paused at {success_count}.")
+            await status_msg.reply_text(f"❌ Error sending file. Process paused at {success_count}.\n\n**RAW SYSTEM ERROR:** `{e}`")
             break
             
     if process_id in active_processes:
