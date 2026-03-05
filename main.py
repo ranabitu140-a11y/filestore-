@@ -10,10 +10,10 @@ from pyrogram.errors import FloodWait
 
 # --- Configuration & Credentials ---
 API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", ""))
-BOT_TOKEN = os.environ.get("BOT_TOKEN", ""))
 DB_CHANNEL_ID = int(os.environ.get("DB_CHANNEL_ID", "0"))
-MONGO_URI = os.environ.get("MONGO_URI", ""))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+MONGO_URI = os.environ.get("MONGO_URI", "")
 
 # --- Initialization ---
 app = Client("permanent_store_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
