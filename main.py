@@ -28,6 +28,39 @@ active_deliveries = db.active_deliveries
 user_states = {}
 active_processes = {}
 
+# ==========================================
+# 🚨 PEER CACHE & ADMIN HELPERS 🚨
+# ==========================================
+async def ensure_peer_loaded(client, chat_id, retries=3, delay=1.0):
+    """
+    Force Telegram to load the peer into session cache by calling get_chat().
+    Retry a few times with small delay if it fails.
+    Returns True if loaded, False otherwise.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            info = await client.get_chat(chat_id)
+            print(f"[warmup] chat loaded: id={getattr(info, 'id', None)} title={getattr(info, 'title', None)}")
+            return True
+        except Exception as e:
+            print(f"[warmup] attempt {attempt} failed for {chat_id}: {e}")
+            if attempt < retries:
+                await asyncio.sleep(delay)
+    return False
+
+async def is_bot_admin(client, chat_id):
+    """Return True if bot is a member/admin of chat_id and has permission to post."""
+    me = await client.get_me()
+    try:
+        member = await client.get_chat_member(chat_id, me.id)
+        status = getattr(member, "status", "")
+        is_admin = status in ("administrator", "creator")
+        print(f"[admin-check] bot status in {chat_id}: {status}")
+        return is_admin
+    except Exception as e:
+        print(f"[admin-check] get_chat_member failed for {chat_id}: {e}")
+        return False
+
 def generate_hash(length=8):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
@@ -106,52 +139,68 @@ async def handle_batch_messages(client, message):
         processed_count = 0
         is_cancelled = False
 
-        try:
-            # Extra Safety Fix: Force Telegram to load the peer first
-            await client.get_chat(source_chat_id)
-            await client.get_chat(DB_CHANNEL_ID)
-            
-            source_peer = await client.resolve_peer(source_chat_id)
-            target_peer = await client.resolve_peer(DB_CHANNEL_ID)
-        except Exception as e:
-            return await status_msg.edit_text(f"❌ Error resolving channels. Is the bot an admin? Error: {e}")
+        print(f"[debug] trying to resolve source={source_chat_id} db={DB_CHANNEL_ID}")
 
         for i in range(0, total_files, chunk_size):
             if active_processes.get(process_id):
                 is_cancelled = True
-                break 
-                
+                break
+
             chunk = message_ids_to_process[i:i + chunk_size]
-            
+
             try:
-                random_ids = [client.rnd_id() for _ in chunk]
-                result = await client.invoke(
-                    raw.functions.messages.ForwardMessages(
-                        from_peer=source_peer,
-                        id=chunk,
-                        to_peer=target_peer,
-                        random_id=random_ids,
-                        drop_author=True 
+                # Ensure source and DB channel peers are loaded (force)
+                ok1 = await ensure_peer_loaded(client, source_chat_id)
+                ok2 = await ensure_peer_loaded(client, DB_CHANNEL_ID)
+                if not ok1 or not ok2:
+                    await status_msg.edit_text("❌ Unable to load channel peers. Please ensure bot is in both channels.")
+                    break
+
+                # Try high-level forward first
+                try:
+                    forwarded_msgs = await client.forward_messages(
+                        chat_id=DB_CHANNEL_ID,
+                        from_chat_id=source_chat_id,
+                        message_ids=chunk,
+                        disable_notification=True,
+                        drop_author=True
                     )
-                )
-                
-                for update in result.updates:
-                    if hasattr(update, "message") and hasattr(update.message, "id"):
-                         db_message_ids.append(update.message.id)
-                
+                    # Safely collect the newly generated message IDs
+                    for msg in forwarded_msgs:
+                        if msg and msg.id:
+                            db_message_ids.append(msg.id)
+                            
+                except Exception as e_forward:
+                    print(f"[batch] forward_messages failed, trying raw invoke: {e_forward}")
+                    # Fallback to raw MTProto invoke
+                    random_ids = [client.rnd_id() for _ in chunk]
+                    result = await client.invoke(
+                        raw.functions.messages.ForwardMessages(
+                            from_peer=await client.resolve_peer(source_chat_id),
+                            id=chunk,
+                            to_peer=await client.resolve_peer(DB_CHANNEL_ID),
+                            random_id=random_ids,
+                            drop_author=True
+                        )
+                    )
+                    for update in result.updates:
+                        if hasattr(update, "message") and hasattr(update.message, "id"):
+                            db_message_ids.append(update.message.id)
+
                 processed_count += len(chunk)
-                
                 prog_str = get_progress_string(processed_count, total_files, start_time)
+                
                 try:
                     await status_msg.edit_text(f"🔄 **Batching in Progress...**\n\n{prog_str}", reply_markup=cancel_kb)
                 except Exception:
-                    pass 
-                
-                await asyncio.sleep(2) 
-                
+                    pass
+
+                await asyncio.sleep(2)
+
             except FloodWait as e:
                 await asyncio.sleep(e.value)
-            except Exception:
+            except Exception as e:
+                print(f"[batch] skipping chunk due to error: {e}")
                 pass
             
         del active_processes[process_id]
@@ -177,7 +226,7 @@ async def handle_batch_messages(client, message):
 
     elif state_data["state"] == "waiting_for_channel_id":
         try:
-            target_channel = int(message.text) # Cast to int to prevent ValueError
+            target_channel = int(message.text)
         except ValueError:
             return await message.reply("❌ Please send a valid numeric Channel ID (e.g., -1001234567890)")
             
@@ -258,17 +307,12 @@ async def deliver_content(client, message, url_hash, target_chat_id):
     remaining_files = db_message_ids[start_index:]
     is_channel = str(target_chat_id).startswith("-100")
 
+    print(f"[debug] trying to resolve db={DB_CHANNEL_ID} target={target_chat_id}")
+
     # ==========================================
     # PATH A: ULTRA-FAST UPLOAD (FOR CHANNELS)
     # ==========================================
     if is_channel:
-        try:
-            await client.get_chat(target_chat_id) 
-            source_peer = await client.resolve_peer(DB_CHANNEL_ID)
-            target_peer = await client.resolve_peer(target_chat_id)
-        except Exception as e:
-            return await status_msg.edit_text(f"❌ Error resolving destination channel. Am I an admin? {e}")
-
         chunk_size = 100
         for i in range(0, len(remaining_files), chunk_size):
             if active_processes.get(process_id):
@@ -277,38 +321,50 @@ async def deliver_content(client, message, url_hash, target_chat_id):
                 return
 
             chunk = remaining_files[i:i + chunk_size]
+
+            # Ensure peers are locked in
+            if not await ensure_peer_loaded(client, DB_CHANNEL_ID) or not await ensure_peer_loaded(client, target_chat_id):
+                await status_msg.edit_text(f"❌ Unable to load destination peer {target_chat_id}. Make sure I'm a member/admin.")
+                break
+
             try:
-                random_ids = [client.rnd_id() for _ in chunk]
-                await client.invoke(
-                    raw.functions.messages.ForwardMessages(
-                        from_peer=source_peer,
-                        id=chunk,
-                        to_peer=target_peer,
-                        random_id=random_ids,
-                        drop_author=True 
-                    )
+                # High-level forward
+                await client.forward_messages(
+                    chat_id=target_chat_id,
+                    from_chat_id=DB_CHANNEL_ID,
+                    message_ids=chunk,
+                    disable_notification=True,
+                    drop_author=True
                 )
-                
+
                 success_count += len(chunk)
-                
                 await active_deliveries.update_one(
                     {"hash": url_hash, "target": str(target_chat_id)},
                     {"$set": {"last_sent_index": success_count}},
                     upsert=True
                 )
-                
+
                 prog_str = get_progress_string(success_count, total_files, start_time)
                 try:
                     await status_msg.edit_text(f"🚀 **Fast-Uploading to Channel...**\n\n{prog_str}", reply_markup=cancel_kb)
                 except Exception:
                     pass
-                
-                await asyncio.sleep(2) 
-                
+
+                await asyncio.sleep(2)
+
             except FloodWait as e:
                 await asyncio.sleep(e.value)
             except Exception as e:
-                print(f"Skipping chunk: {e}")
+                print(f"[deliver channel] chunk skipped: {e}")
+                # Defensive retry loop on failure
+                try:
+                    await asyncio.sleep(1)
+                    await ensure_peer_loaded(client, target_chat_id, retries=2, delay=1)
+                    await client.forward_messages(chat_id=target_chat_id, from_chat_id=DB_CHANNEL_ID, message_ids=chunk, drop_author=True)
+                    success_count += len(chunk)
+                except Exception as e2:
+                    print(f"[deliver channel] retry failed: {e2}")
+                    continue
 
     # ==========================================
     # PATH B: SAFE DRIP-FEED (FOR USER DMs)
@@ -321,7 +377,6 @@ async def deliver_content(client, message, url_hash, target_chat_id):
                 return
 
             try:
-                # Extra Safety Fix: Resolve DB channel peer directly before sending
                 await client.resolve_peer(DB_CHANNEL_ID)
                 
                 await client.copy_message(
@@ -345,7 +400,7 @@ async def deliver_content(client, message, url_hash, target_chat_id):
                     except Exception:
                         pass
 
-                await asyncio.sleep(0.05) # Optimized 10x faster delivery speed for DMs
+                await asyncio.sleep(0.05) 
                 
             except FloodWait as e:
                 await asyncio.sleep(e.value)
@@ -368,15 +423,12 @@ async def deliver_content(client, message, url_hash, target_chat_id):
 async def warmup_peers():
     try:
         print("Loading peer cache...")
-        
-        # Load DB channel
         await app.get_chat(DB_CHANNEL_ID)
         
-        # Load all dialogs to cache peers
         async for dialog in app.get_dialogs():
             pass
             
-        print("Peer cache ready")
+        print("✅ Peer cache loaded successfully")
     except Exception as e:
         print("Warmup failed:", e)
 
@@ -392,10 +444,10 @@ if __name__ == "__main__":
     
     app.start()
     
-    # Run initialization sequences manually on the active loop
     app.loop.run_until_complete(warmup_peers())
     app.loop.run_until_complete(resume_interrupted_deliveries())
     
     print("Bot ready")
     
     idle()
+    app.stop()
