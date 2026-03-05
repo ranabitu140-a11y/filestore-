@@ -107,7 +107,10 @@ async def handle_batch_messages(client, message):
         is_cancelled = False
 
         try:
+            # Extra Safety Fix: Force Telegram to load the peer first
             await client.get_chat(source_chat_id)
+            await client.get_chat(DB_CHANNEL_ID)
+            
             source_peer = await client.resolve_peer(source_chat_id)
             target_peer = await client.resolve_peer(DB_CHANNEL_ID)
         except Exception as e:
@@ -174,7 +177,7 @@ async def handle_batch_messages(client, message):
 
     elif state_data["state"] == "waiting_for_channel_id":
         try:
-            target_channel = int(message.text) # 🚨 FIXED: Cast to Integer
+            target_channel = int(message.text) # Cast to int to prevent ValueError
         except ValueError:
             return await message.reply("❌ Please send a valid numeric Channel ID (e.g., -1001234567890)")
             
@@ -318,7 +321,7 @@ async def deliver_content(client, message, url_hash, target_chat_id):
                 return
 
             try:
-                # 🚨 FIXED: Explicitly resolve peer right before copy
+                # Extra Safety Fix: Resolve DB channel peer directly before sending
                 await client.resolve_peer(DB_CHANNEL_ID)
                 
                 await client.copy_message(
@@ -342,7 +345,7 @@ async def deliver_content(client, message, url_hash, target_chat_id):
                     except Exception:
                         pass
 
-                await asyncio.sleep(0.05) # 🚨 FIXED: 10x faster delivery speed
+                await asyncio.sleep(0.05) # Optimized 10x faster delivery speed for DMs
                 
             except FloodWait as e:
                 await asyncio.sleep(e.value)
@@ -362,18 +365,20 @@ async def deliver_content(client, message, url_hash, target_chat_id):
 # ==========================================
 # 🚨 BOOT SEQUENCE & AUTOMATED WARMUP 🚨
 # ==========================================
-async def warmup():
+async def warmup_peers():
     try:
-        print("Warming up DB channel...")
+        print("Loading peer cache...")
+        
+        # Load DB channel
         await app.get_chat(DB_CHANNEL_ID)
         
-        # 🚨 FIXED: Brute-force loads all channels/groups/private chats into cache
+        # Load all dialogs to cache peers
         async for dialog in app.get_dialogs():
             pass
             
-        print("✅ Peer cache loaded successfully")
+        print("Peer cache ready")
     except Exception as e:
-        print("Warmup error:", e)
+        print("Warmup failed:", e)
 
 async def resume_interrupted_deliveries():
     """Finds any deliveries that were interrupted by a server restart."""
@@ -385,13 +390,12 @@ async def resume_interrupted_deliveries():
 if __name__ == "__main__":
     print("Bot starting...")
     
-    # 🚨 FIXED: The proper Pyrogram-safe startup and loop binding sequence
     app.start()
     
-    app.loop.run_until_complete(warmup())
+    # Run initialization sequences manually on the active loop
+    app.loop.run_until_complete(warmup_peers())
     app.loop.run_until_complete(resume_interrupted_deliveries())
     
     print("Bot ready")
     
-    idle()
-    app.stop()
+    app.idle()
