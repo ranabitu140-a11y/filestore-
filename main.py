@@ -437,7 +437,63 @@ async def resume_interrupted_deliveries():
     cursor = active_deliveries.find({})
     async for delivery in cursor:
         url_hash = delivery["hash"]
-        print(f"Server restart detected. Auto-resume requires user to click /start {url_hash} again to re-bind the DM status window.")
+        print(f"Server restart detected. Auto-resume requires user to click /start {url_hash} again to re-bind the DM status window.") 
+
+async def diagnose_and_warm(client, chat_id):
+    """
+    1) Logs bot id
+    2) Tries get_chat() and get_chat_member()
+    3) Returns tuple (ok:boolean, reason:str)
+    """
+    me = await client.get_me()
+    print(f"[diag] running as: id={me.id} username=@{me.username}")
+
+    try:
+        info = await client.get_chat(chat_id)
+        print(f"[diag] get_chat OK: id={getattr(info,'id',None)} title={getattr(info,'title',None)}")
+    except Exception as e:
+        print(f"[diag] get_chat FAILED for {chat_id}: {type(e).__name__}: {e}")
+        # Try get_chat_member to get clearer reason
+        try:
+            member = await client.get_chat_member(chat_id, me.id)
+            status = getattr(member, "status", None)
+            print(f"[diag] get_chat_member succeeded unexpectedly: status={status}")
+            if status in ("administrator", "creator"):
+                return True, "member_and_admin_but_get_chat_failed"
+            return False, f"member_but_not_admin:{status}"
+        except Exception as e2:
+            print(f"[diag] get_chat_member FAILED for {chat_id}: {type(e2).__name__}: {e2}")
+            # common exception texts: "USER_NOT_PARTICIPANT", "CHAT_ADMIN_REQUIRED", etc.
+            return False, f"not_member_or_inaccessible:{type(e2).__name__}:{e2}"
+
+    # If get_chat succeeded, check bot permissions
+    try:
+        member = await client.get_chat_member(chat_id, me.id)
+        status = getattr(member, "status", None)
+        print(f"[diag] Bot membership status in {chat_id}: {status}")
+        if status in ("administrator", "creator"):
+            return True, "ok_admin"
+        if status in ("member", "restricted"):
+            return False, f"not_admin:{status}"
+        return False, f"unknown_status:{status}"
+    except Exception as e:
+        print(f"[diag] get_chat_member exception after get_chat: {type(e).__name__}: {e}")
+        return False, f"member_check_failed:{type(e).__name__}:{e}"
+
+# Replace your existing ensure_peer_loaded with this smarter version
+async def ensure_peer_loaded(client, chat_id, retries=5, delay=1.0):
+    for attempt in range(1, retries + 1):
+        ok, reason = await diagnose_and_warm(client, chat_id)
+        if ok:
+            print(f"[warmup] peer loaded {chat_id}")
+            return True
+        print(f"[warmup] attempt {attempt}/{retries} failed for {chat_id}: {reason}")
+        # If it's a membership issue, no amount of retries will fix it; break early
+        if reason.startswith("not_member") or reason.startswith("not_admin") or reason.startswith("not_member_or_inaccessible"):
+            # return False quickly so caller can show a clear message
+            return False
+        await asyncio.sleep(delay)
+    return False
 
 if __name__ == "__main__":
     print("Bot starting...")
