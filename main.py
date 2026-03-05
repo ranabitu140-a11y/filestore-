@@ -29,6 +29,19 @@ active_deliveries = db.active_deliveries # NEW: Checkpointing for 50k+ files
 user_states = {}
 active_processes = {}
 
+# ==========================================
+# 🚨 CACHE WARMUP HANDLER 🚨
+# ==========================================
+@app.on_message(filters.forwarded & filters.private)
+async def cache_warmup(client, message):
+    """Listens for forwards from the DB Channel to memorize the access_hash."""
+    if message.forward_from_chat and message.forward_from_chat.id == DB_CHANNEL_ID:
+        await message.reply(
+            "✅ **Database Channel Cached Successfully!**\n\n"
+            "My memory is warmed up. I now have the access_hash for the Database Channel. "
+            "You can now safely run batching and delivery processes!"
+        )
+
 def generate_hash(length=8):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
@@ -232,6 +245,7 @@ async def cancel_deliver_cb(client, callback_query):
     url_hash = callback_query.data.split("_")[2]
     active_processes[f"deliver_{url_hash}"] = True
     await callback_query.answer("Stopping file delivery...", show_alert=True)
+
 async def deliver_content(client, message, url_hash, target_chat_id):
     link_data = await links_collection.find_one({"hash": url_hash})
     total_files = len(link_data["db_message_ids"])
@@ -257,8 +271,6 @@ async def deliver_content(client, message, url_hash, target_chat_id):
     active_processes[process_id] = False
     start_time = time.time()
     
-    # ... (The rest of your function stays exactly the same) ...
-
     cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Delivery", callback_data=f"cancel_deliver_{url_hash}")]])
     
     if start_index > 0:
