@@ -258,10 +258,21 @@ async def deliver_content(client, message, url_hash, target_chat_id):
     # ==========================================
     if is_channel:
         try:
+            # 1. WARM UP THE CACHE: Force the bot to look at both channels first
+            await client.get_chat(DB_CHANNEL_ID)
+            await client.get_chat(target_chat_id)
+            
+            # 2. RESOLVE PEERS: Now that they are cached, this raw command will work perfectly
             source_peer = await client.resolve_peer(DB_CHANNEL_ID)
             target_peer = await client.resolve_peer(target_chat_id)
+            
         except Exception as e:
-            return await status_msg.edit_text(f"❌ Error resolving destination channel. Am I an admin? {e}")
+            return await status_msg.edit_text(
+                f"❌ **Error resolving channels.**\n\n"
+                f"1. Ensure I am an Admin in the DB Channel.\n"
+                f"2. Ensure I am an Admin in the Destination Channel.\n\n"
+                f"**System Error:** `{e}`"
+            )
 
         chunk_size = 100
         for i in range(0, len(remaining_files), chunk_size):
