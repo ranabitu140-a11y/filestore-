@@ -3,13 +3,12 @@ import asyncio
 import random
 import string
 import time
-from pyrogram import Client, filters, raw
+from pyrogram import Client, filters, raw, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram.errors import FloodWait
 
 # --- Configuration & Credentials ---
-# Pulling from secure environment variables
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -23,7 +22,7 @@ app = Client("permanent_store_bot", api_id=API_ID, api_hash=API_HASH, bot_token=
 db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client.bot_database
 links_collection = db.stored_links
-active_deliveries = db.active_deliveries # NEW: Checkpointing for 50k+ files
+active_deliveries = db.active_deliveries
 
 # State and Process managers
 user_states = {}
@@ -108,6 +107,7 @@ async def handle_batch_messages(client, message):
         is_cancelled = False
 
         try:
+            await client.get_chat(source_chat_id)
             source_peer = await client.resolve_peer(source_chat_id)
             target_peer = await client.resolve_peer(DB_CHANNEL_ID)
         except Exception as e:
@@ -116,7 +116,7 @@ async def handle_batch_messages(client, message):
         for i in range(0, total_files, chunk_size):
             if active_processes.get(process_id):
                 is_cancelled = True
-                break # Partial save triggers
+                break 
                 
             chunk = message_ids_to_process[i:i + chunk_size]
             
@@ -173,14 +173,18 @@ async def handle_batch_messages(client, message):
             await status_msg.edit_text(f"✅ **Batch Successful!**\n\n{final_str}\n\n🔗 **Your permanent link:**\n`{shareable_link}`")
 
     elif state_data["state"] == "waiting_for_channel_id":
-        target_channel = message.text
+        try:
+            target_channel = int(message.text) # 🚨 FIXED: Cast to Integer
+        except ValueError:
+            return await message.reply("❌ Please send a valid numeric Channel ID (e.g., -1001234567890)")
+            
         url_hash = state_data["hash"]
         del user_states[user_id]
         
         await deliver_content(client, message, url_hash, target_chat_id=target_channel)
 
 # ==========================================
-# 2. RETRIEVAL & DELIVERY WORKFLOW
+# 2. RETRIEVAL & HYBRID DELIVERY WORKFLOW
 # ==========================================
 
 @app.on_message(filters.command("start") & filters.private)
@@ -231,8 +235,8 @@ async def cancel_deliver_cb(client, callback_query):
 async def deliver_content(client, message, url_hash, target_chat_id):
     link_data = await links_collection.find_one({"hash": url_hash})
     total_files = len(link_data["db_message_ids"])
-    
-    # --- MongoDB Checkpointing Logic ---
+    db_message_ids = link_data["db_message_ids"]
+
     checkpoint = await active_deliveries.find_one({"hash": url_hash, "target": str(target_chat_id)})
     start_index = checkpoint["last_sent_index"] if checkpoint else 0
 
@@ -248,58 +252,146 @@ async def deliver_content(client, message, url_hash, target_chat_id):
         status_msg = await message.reply(f"⏳ **Initializing Delivery** to {target_chat_id}...", reply_markup=cancel_kb)
     
     success_count = start_index
-    remaining_files = link_data["db_message_ids"][start_index:]
-    
-    for idx, msg_id in enumerate(remaining_files, start=start_index + 1):
-        if active_processes.get(process_id):
-            await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**\n(Click the link again to resume later)")
-            del active_processes[process_id]
-            return
+    remaining_files = db_message_ids[start_index:]
+    is_channel = str(target_chat_id).startswith("-100")
 
+    # ==========================================
+    # PATH A: ULTRA-FAST UPLOAD (FOR CHANNELS)
+    # ==========================================
+    if is_channel:
         try:
-            await client.copy_message(chat_id=target_chat_id, from_chat_id=DB_CHANNEL_ID, message_id=msg_id)
-            success_count += 1
-            
-            # Save a checkpoint every 100 files to survive server restarts
-            if success_count % 100 == 0:
+            await client.get_chat(target_chat_id) 
+            source_peer = await client.resolve_peer(DB_CHANNEL_ID)
+            target_peer = await client.resolve_peer(target_chat_id)
+        except Exception as e:
+            return await status_msg.edit_text(f"❌ Error resolving destination channel. Am I an admin? {e}")
+
+        chunk_size = 100
+        for i in range(0, len(remaining_files), chunk_size):
+            if active_processes.get(process_id):
+                await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**\n(Click link again to resume later)")
+                del active_processes[process_id]
+                return
+
+            chunk = remaining_files[i:i + chunk_size]
+            try:
+                random_ids = [client.rnd_id() for _ in chunk]
+                await client.invoke(
+                    raw.functions.messages.ForwardMessages(
+                        from_peer=source_peer,
+                        id=chunk,
+                        to_peer=target_peer,
+                        random_id=random_ids,
+                        drop_author=True 
+                    )
+                )
+                
+                success_count += len(chunk)
+                
                 await active_deliveries.update_one(
                     {"hash": url_hash, "target": str(target_chat_id)},
-                    {"$set": {"last_sent_index": success_count}}
+                    {"$set": {"last_sent_index": success_count}},
+                    upsert=True
                 )
-
-            if success_count % 10 == 0 or success_count == total_files:
+                
                 prog_str = get_progress_string(success_count, total_files, start_time)
                 try:
-                    await status_msg.edit_text(f"📤 **Sending to {target_chat_id}...**\n\n{prog_str}", reply_markup=cancel_kb)
+                    await status_msg.edit_text(f"🚀 **Fast-Uploading to Channel...**\n\n{prog_str}", reply_markup=cancel_kb)
                 except Exception:
                     pass
+                
+                await asyncio.sleep(2) 
+                
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                print(f"Skipping chunk: {e}")
 
-            await asyncio.sleep(0.5) 
-            
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-        except Exception as e:
-            await status_msg.reply_text(f"❌ Error sending file. Ensure bot is admin. Process paused at {success_count}.")
-            break
-            
+    # ==========================================
+    # PATH B: SAFE DRIP-FEED (FOR USER DMs)
+    # ==========================================
+    else:
+        for idx, msg_id in enumerate(remaining_files, start=start_index + 1):
+            if active_processes.get(process_id):
+                await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**\n(Click link again to resume later)")
+                del active_processes[process_id]
+                return
+
+            try:
+                # 🚨 FIXED: Explicitly resolve peer right before copy
+                await client.resolve_peer(DB_CHANNEL_ID)
+                
+                await client.copy_message(
+                    chat_id=target_chat_id, 
+                    from_chat_id=DB_CHANNEL_ID, 
+                    message_id=msg_id
+                )
+                success_count += 1
+                
+                if success_count % 50 == 0 or success_count == total_files:
+                    await active_deliveries.update_one(
+                        {"hash": url_hash, "target": str(target_chat_id)},
+                        {"$set": {"last_sent_index": success_count}},
+                        upsert=True
+                    )
+
+                if success_count % 10 == 0 or success_count == total_files:
+                    prog_str = get_progress_string(success_count, total_files, start_time)
+                    try:
+                        await status_msg.edit_text(f"📥 **Sending to DM...**\n\n{prog_str}", reply_markup=cancel_kb)
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(0.05) # 🚨 FIXED: 10x faster delivery speed
+                
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                await status_msg.reply_text(f"❌ Error sending file. Process paused at {success_count}.\n\nRaw Error: `{e}`")
+                break
+
     if process_id in active_processes:
         del active_processes[process_id]
             
     if success_count == total_files:
         await active_deliveries.delete_one({"hash": url_hash, "target": str(target_chat_id)})
         final_str = get_progress_string(success_count, total_files, start_time)
-        await status_msg.edit_text(f"✅ **Delivery Complete to {target_chat_id}!**\n\n{final_str}")
+        await status_msg.edit_text(f"✅ **Delivery Complete!**\n\n{final_str}")
 
-# --- Auto-Resume Boot Sequence ---
+
+# ==========================================
+# 🚨 BOOT SEQUENCE & AUTOMATED WARMUP 🚨
+# ==========================================
+async def warmup():
+    try:
+        print("Warming up DB channel...")
+        await app.get_chat(DB_CHANNEL_ID)
+        
+        # 🚨 FIXED: Brute-force loads all channels/groups/private chats into cache
+        async for dialog in app.get_dialogs():
+            pass
+            
+        print("✅ Peer cache loaded successfully")
+    except Exception as e:
+        print("Warmup error:", e)
+
 async def resume_interrupted_deliveries():
-    """Finds any deliveries that were interrupted by a server restart and automatically resumes them."""
+    """Finds any deliveries that were interrupted by a server restart."""
     cursor = active_deliveries.find({})
     async for delivery in cursor:
         url_hash = delivery["hash"]
-        target = delivery["target"]
         print(f"Server restart detected. Auto-resume requires user to click /start {url_hash} again to re-bind the DM status window.")
-        # Alternatively, you could auto-trigger the loop here, but it's safer to let the checkpoint wait for the user.
 
 if __name__ == "__main__":
-    print("Bot is starting with MTProto Chunking & MongoDB Checkpointing...")
-    app.run()
+    print("Bot starting...")
+    
+    # 🚨 FIXED: The proper Pyrogram-safe startup and loop binding sequence
+    app.start()
+    
+    app.loop.run_until_complete(warmup())
+    app.loop.run_until_complete(resume_interrupted_deliveries())
+    
+    print("Bot ready")
+    
+    idle()
+    app.stop()
