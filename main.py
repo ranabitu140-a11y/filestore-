@@ -79,51 +79,90 @@ async def restore_peers(client):
 
 async def get_peer(client, chat_id: int):
     """
-    Guaranteed peer resolution:
-      1. Try resolve_peer() directly (works if already in session).
-      2. Try get_messages() to force Telegram to send us the peer info.
-      3. Fall back to saved access_hash from MongoDB and build InputChannel manually.
-    Saves to MongoDB on every success so the next restart is instant.
+    4-tier peer resolution that works even on a blank session:
+      1. Direct resolve_peer (fast path if already cached)
+      2. Raw channels.GetChannels with access_hash=0  ← key fix
+      3. get_messages warmup then re-resolve
+      4. Saved access_hash from MongoDB
     """
-    # ── Step 1: direct resolve ──────────────────────────────────────────────
+    # ── Tier 1: already in session ───────────────────────────────────────────
     try:
         peer = await client.resolve_peer(chat_id)
-        await save_peer(client, chat_id)   # keep DB fresh
+        await save_peer(client, chat_id)
         return peer
     except Exception:
         pass
 
-    # ── Step 2: force Telegram to hand us the peer via get_messages ─────────
+    # ── Tier 2: raw GetChannels with access_hash=0 ───────────────────────────
+    # Telegram returns full channel info (including real access_hash)
+    # for any channel the bot is a member of, even with access_hash=0.
     try:
-        # Fetching any message (even non-existent id=1) makes Telegram reply
-        # with the channel object, which populates Pyrogram's peer cache.
+        # Strip the -100 prefix to get the bare channel_id
+        raw_id = int(str(abs(chat_id)).lstrip("100") if str(chat_id).startswith("-100") else str(abs(chat_id)))
+        # More reliable stripping:
+        s = str(chat_id)
+        raw_id = int(s[4:]) if s.startswith("-100") else abs(chat_id)
+
+        result = await client.invoke(
+            raw.functions.channels.GetChannels(
+                id=[raw.types.InputChannel(channel_id=raw_id, access_hash=0)]
+            )
+        )
+        if result.chats:
+            ch = result.chats[0]
+            access_hash = ch.access_hash
+            # Inject into session so high-level methods work from here on
+            await client.storage.update_peers(
+                [(ch.id, access_hash, "channel", getattr(ch, "username", None), None)]
+            )
+            # Persist to MongoDB
+            await peer_cache_col.update_one(
+                {"chat_id": chat_id},
+                {"$set": {
+                    "chat_id":     chat_id,
+                    "channel_id":  ch.id,
+                    "access_hash": access_hash,
+                }},
+                upsert=True,
+            )
+            print(f"[get_peer] ✅ resolved via GetChannels(0): {chat_id}  access_hash={access_hash}")
+            return raw.types.InputChannel(channel_id=ch.id, access_hash=access_hash)
+    except Exception as e:
+        print(f"[get_peer] GetChannels(0) failed for {chat_id}: {e}")
+
+    # ── Tier 3: get_messages warmup ──────────────────────────────────────────
+    try:
         await client.get_messages(chat_id, message_ids=[1])
         peer = await client.resolve_peer(chat_id)
         await save_peer(client, chat_id)
-        print(f"[get_peer] warmed via get_messages: {chat_id}")
+        print(f"[get_peer] ✅ warmed via get_messages: {chat_id}")
         return peer
     except Exception as e:
         print(f"[get_peer] get_messages warmup failed for {chat_id}: {e}")
 
-    # ── Step 3: build InputChannel from saved access_hash ───────────────────
+    # ── Tier 4: saved access_hash from MongoDB ───────────────────────────────
     doc = await peer_cache_col.find_one({"chat_id": chat_id})
     if doc:
-        try:
-            peer = raw.types.InputChannel(
-                channel_id=doc["channel_id"],
-                access_hash=doc["access_hash"],
-            )
-            print(f"[get_peer] using cached access_hash for {chat_id}")
-            return peer
-        except Exception as e:
-            print(f"[get_peer] cached peer build failed for {chat_id}: {e}")
+        print(f"[get_peer] ✅ using MongoDB cached access_hash for {chat_id}")
+        return raw.types.InputChannel(
+            channel_id=doc["channel_id"],
+            access_hash=doc["access_hash"],
+        )
 
-    print(f"[get_peer] ❌ all strategies exhausted for {chat_id}")
+    print(f"[get_peer] ❌ all tiers exhausted for {chat_id}")
     return None
 
 
-def db_id():
-    return DB_CHANNEL_ID
+async def warmup_peers():
+    print("[boot] Restoring MongoDB peer cache into session...")
+    await restore_peers(app)
+
+    print("[boot] Resolving DB channel via GetChannels(0)...")
+    peer = await get_peer(app, db_id())
+    if peer:
+        print(f"[boot] ✅ DB channel ready")
+    else:
+        print("[boot] ❌ DB channel FAILED — confirm bot is a member of the channel")
 
 
 # ==========================================
