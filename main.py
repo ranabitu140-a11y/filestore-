@@ -376,4 +376,7 @@ async def main():
     await app.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Use the existing event loop so MongoDB doesn't freeze
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+    
