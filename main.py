@@ -232,11 +232,23 @@ async def cancel_deliver_cb(client, callback_query):
     url_hash = callback_query.data.split("_")[2]
     active_processes[f"deliver_{url_hash}"] = True
     await callback_query.answer("Stopping file delivery...", show_alert=True)
-
 async def deliver_content(client, message, url_hash, target_chat_id):
     link_data = await links_collection.find_one({"hash": url_hash})
     total_files = len(link_data["db_message_ids"])
     
+    # ==========================================
+    # 🚨 THE CACHE WARMING FIX 🚨
+    # Force the bot to remember the channels before doing any work
+    # ==========================================
+    try:
+        await client.get_chat(DB_CHANNEL_ID)
+        # If the target is a channel, warm that up too
+        if str(target_chat_id).startswith("-100"):
+            await client.get_chat(target_chat_id)
+    except Exception as e:
+        return await message.reply(f"❌ **Connection Error:** Could not access channels. Ensure bot is admin. Raw Error: `{e}`")
+    # ==========================================
+
     # --- MongoDB Checkpointing Logic ---
     checkpoint = await active_deliveries.find_one({"hash": url_hash, "target": str(target_chat_id)})
     start_index = checkpoint["last_sent_index"] if checkpoint else 0
@@ -244,6 +256,9 @@ async def deliver_content(client, message, url_hash, target_chat_id):
     process_id = f"deliver_{url_hash}"
     active_processes[process_id] = False
     start_time = time.time()
+    
+    # ... (The rest of your function stays exactly the same) ...
+
     cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Delivery", callback_data=f"cancel_deliver_{url_hash}")]])
     
     if start_index > 0:
