@@ -158,7 +158,7 @@ async def warmup_peers():
     await restore_peers(app)
 
     print("[boot] Resolving DB channel via GetChannels(0)...")
-    peer = await get_peer(app, db_id())
+    peer = await get_peer(app, DB_CHANNEL_ID)  # ← changed db_id() to DB_CHANNEL_ID
     if peer:
         print(f"[boot] ✅ DB channel ready")
     else:
