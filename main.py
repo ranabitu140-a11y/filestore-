@@ -3,13 +3,13 @@ import asyncio
 import random
 import string
 import time
-from pyrogram import Client, filters, raw
+from datetime import datetime
+from pyrogram import Client, filters, raw, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram.errors import FloodWait
 
 # --- Configuration & Credentials ---
-# Pulling from secure environment variables
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -23,11 +23,37 @@ app = Client("permanent_store_bot", api_id=API_ID, api_hash=API_HASH, bot_token=
 db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client.bot_database
 links_collection = db.stored_links
-active_deliveries = db.active_deliveries # NEW: Checkpointing for 50k+ files
+active_deliveries = db.active_deliveries
+media_collection = db.media 
 
 # State and Process managers
 user_states = {}
 active_processes = {}
+
+# ==========================================
+# 🚨 PEER CACHE & ADMIN HELPERS 🚨
+# ==========================================
+async def ensure_peer_loaded(client, chat_id, retries=3, delay=1.0):
+    for attempt in range(1, retries + 1):
+        try:
+            info = await client.get_chat(chat_id)
+            print(f"[warmup] chat loaded: id={getattr(info, 'id', None)} title={getattr(info, 'title', None)}")
+            return True
+        except Exception as e:
+            print(f"[warmup] attempt {attempt} failed for {chat_id}: {e}")
+            if attempt < retries:
+                await asyncio.sleep(delay)
+    return False
+
+async def is_bot_admin(client, chat_id):
+    me = await client.get_me()
+    try:
+        member = await client.get_chat_member(chat_id, me.id)
+        status = getattr(member, "status", "")
+        is_admin = status in ("administrator", "creator")
+        return is_admin
+    except Exception as e:
+        return False
 
 def generate_hash(length=8):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
@@ -55,6 +81,87 @@ def get_progress_string(current, total, start_time):
     )
 
 # ==========================================
+# 🚨 IMMORTAL CHANNEL BACKUP AUTO-INDEXER 🚨
+# ==========================================
+@app.on_message(filters.chat(DB_CHANNEL_ID))
+async def auto_index_channel_media(client, message):
+    if message.media and message.media.value in ["document", "video", "audio", "photo", "animation"]:
+        media = getattr(message, message.media.value)
+        file_id = media.file_id
+        file_unique_id = media.file_unique_id
+        media_type = message.media.value
+        file_name = getattr(media, "file_name", f"{media_type}_{file_unique_id}")
+        
+        url_hash = generate_hash()
+        
+        try:
+            await media_collection.insert_one({
+                "_id": file_id, 
+                "hash": url_hash,
+                "message_id": message.id, # 🚨 SAVING MESSAGE ID FOR UNIFIED DELIVERY
+                "file_unique_id": file_unique_id,
+                "type": media_type,
+                "file_name": file_name,
+                "source_channel": DB_CHANNEL_ID,
+                "added_date": datetime.now().isoformat()
+            })
+            
+            bot_username = (await client.get_me()).username
+            shareable_link = f"https://t.me/{bot_username}?start={url_hash}"
+            
+            try:
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Copy Permanent Link", url=shareable_link)]])
+                await message.edit_reply_markup(reply_markup)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+# ==========================================
+# 🚨 NEW: EXPLICIT DB UPLOAD COMMAND 🚨
+# ==========================================
+@app.on_message(filters.command("dbupload") & filters.private)
+async def db_upload_command(client, message):
+    """
+    Use this by replying to a file with /dbupload, OR by sending a file with /dbupload in the caption.
+    It copies the file directly to the DB Channel, indexes it, and returns the unified link.
+    """
+    target_msg = message.reply_to_message if message.reply_to_message else message
+    
+    if not target_msg.media or target_msg.media.value not in ["document", "video", "audio", "photo", "animation"]:
+        return await message.reply("❌ Please reply to a media file, or send a file with `/dbupload` in the caption.")
+
+    status = await message.reply("⏳ Uploading to Database Channel...")
+
+    try:
+        # Copy to the immortal DB channel
+        copied_msg = await target_msg.copy(DB_CHANNEL_ID)
+        
+        media = getattr(target_msg, target_msg.media.value)
+        url_hash = generate_hash()
+        
+        await media_collection.insert_one({
+            "_id": media.file_id,
+            "hash": url_hash,
+            "message_id": copied_msg.id, # Locks it into the unified delivery system
+            "file_unique_id": media.file_unique_id,
+            "type": target_msg.media.value,
+            "file_name": getattr(media, "file_name", f"{target_msg.media.value}_{media.file_unique_id}"),
+            "source_channel": DB_CHANNEL_ID,
+            "added_date": datetime.now().isoformat()
+        })
+
+        bot_username = (await client.get_me()).username
+        shareable_link = f"https://t.me/{bot_username}?start={url_hash}"
+
+        await status.edit_text(
+            f"✅ **Immortal DB Upload Successful!**\n\n"
+            f"🔗 **Your Unified Link:**\n`{shareable_link}`"
+        )
+    except Exception as e:
+        await status.edit_text(f"❌ Upload failed: {e}")
+
+# ==========================================
 # 1. BATCH CREATION WORKFLOW
 # ==========================================
 
@@ -63,12 +170,15 @@ async def start_batch(client, message):
     user_states[message.from_user.id] = {"state": "waiting_first_msg"}
     await message.reply("Send or forward the **FIRST** message from your channel.")
 
-@app.on_message(filters.private & ~filters.command("start") & ~filters.command("batch"))
+@app.on_message(filters.private & ~filters.command("start") & ~filters.command("batch") & ~filters.command("dbupload"))
 async def handle_batch_messages(client, message):
     user_id = message.from_user.id
     state_data = user_states.get(user_id)
 
     if not state_data:
+        # If a user just sends a file without /dbupload, we casually remind them how to save it permanently.
+        if message.media:
+            await message.reply("💡 Tip: Reply to this file with `/dbupload` to permanently save it to the DB channel and generate a link!")
         return 
 
     if state_data["state"] == "waiting_first_msg":
@@ -107,45 +217,57 @@ async def handle_batch_messages(client, message):
         processed_count = 0
         is_cancelled = False
 
-        try:
-            source_peer = await client.resolve_peer(source_chat_id)
-            target_peer = await client.resolve_peer(DB_CHANNEL_ID)
-        except Exception as e:
-            return await status_msg.edit_text(f"❌ Error resolving channels. Is the bot an admin? Error: {e}")
-
         for i in range(0, total_files, chunk_size):
             if active_processes.get(process_id):
                 is_cancelled = True
-                break # Partial save triggers
-                
+                break
+
             chunk = message_ids_to_process[i:i + chunk_size]
-            
+
             try:
-                random_ids = [client.rnd_id() for _ in chunk]
-                result = await client.invoke(
-                    raw.functions.messages.ForwardMessages(
-                        from_peer=source_peer,
-                        id=chunk,
-                        to_peer=target_peer,
-                        random_id=random_ids,
-                        drop_author=True 
+                ok1 = await ensure_peer_loaded(client, source_chat_id)
+                ok2 = await ensure_peer_loaded(client, DB_CHANNEL_ID)
+                if not ok1 or not ok2:
+                    await status_msg.edit_text("❌ Unable to load channel peers. Please ensure bot is in both channels.")
+                    break
+
+                try:
+                    forwarded_msgs = await client.forward_messages(
+                        chat_id=DB_CHANNEL_ID,
+                        from_chat_id=source_chat_id,
+                        message_ids=chunk,
+                        disable_notification=True,
+                        drop_author=True
                     )
-                )
-                
-                for update in result.updates:
-                    if hasattr(update, "message") and hasattr(update.message, "id"):
-                         db_message_ids.append(update.message.id)
-                
+                    for msg in forwarded_msgs:
+                        if msg and msg.id:
+                            db_message_ids.append(msg.id)
+                            
+                except Exception as e_forward:
+                    random_ids = [client.rnd_id() for _ in chunk]
+                    result = await client.invoke(
+                        raw.functions.messages.ForwardMessages(
+                            from_peer=await client.resolve_peer(source_chat_id),
+                            id=chunk,
+                            to_peer=await client.resolve_peer(DB_CHANNEL_ID),
+                            random_id=random_ids,
+                            drop_author=True
+                        )
+                    )
+                    for update in result.updates:
+                        if hasattr(update, "message") and hasattr(update.message, "id"):
+                            db_message_ids.append(update.message.id)
+
                 processed_count += len(chunk)
-                
                 prog_str = get_progress_string(processed_count, total_files, start_time)
+                
                 try:
                     await status_msg.edit_text(f"🔄 **Batching in Progress...**\n\n{prog_str}", reply_markup=cancel_kb)
                 except Exception:
-                    pass 
-                
-                await asyncio.sleep(2) 
-                
+                    pass
+
+                await asyncio.sleep(2)
+
             except FloodWait as e:
                 await asyncio.sleep(e.value)
             except Exception:
@@ -173,14 +295,18 @@ async def handle_batch_messages(client, message):
             await status_msg.edit_text(f"✅ **Batch Successful!**\n\n{final_str}\n\n🔗 **Your permanent link:**\n`{shareable_link}`")
 
     elif state_data["state"] == "waiting_for_channel_id":
-        target_channel = message.text
+        try:
+            target_channel = int(message.text)
+        except ValueError:
+            return await message.reply("❌ Please send a valid numeric Channel ID (e.g., -1001234567890)")
+            
         url_hash = state_data["hash"]
         del user_states[user_id]
         
         await deliver_content(client, message, url_hash, target_chat_id=target_channel)
 
 # ==========================================
-# 2. RETRIEVAL & DELIVERY WORKFLOW
+# 2. RETRIEVAL & UNIFIED DELIVERY WORKFLOW
 # ==========================================
 
 @app.on_message(filters.command("start") & filters.private)
@@ -188,17 +314,20 @@ async def start_command(client, message):
     if len(message.command) > 1:
         url_hash = message.command[1]
         
+        # 🚨 UNIFIED CHECK: Looks in both collections before responding
         link_data = await links_collection.find_one({"hash": url_hash})
-        if not link_data:
-            return await message.reply("❌ Invalid or expired link.")
+        media_data = await media_collection.find_one({"hash": url_hash})
         
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Send to my DM 📩", callback_data=f"dm_{url_hash}")],
-            [InlineKeyboardButton("Send to my Channel 📢", callback_data=f"ch_{url_hash}")]
-        ])
-        await message.reply("Where would you like to receive these files?", reply_markup=keyboard)
+        if link_data or media_data:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Send to my DM 📩", callback_data=f"dm_{url_hash}")],
+                [InlineKeyboardButton("Send to my Channel 📢", callback_data=f"ch_{url_hash}")]
+            ])
+            return await message.reply("Where would you like to receive the file(s)?", reply_markup=keyboard)
+        
+        await message.reply("❌ Invalid or expired link.")
     else:
-        await message.reply("Hello! I am a permanent file store bot.")
+        await message.reply("Hello! I am a permanent file store bot. Use `/batch` to clone channels, or `/dbupload` to upload individual files.")
 
 @app.on_callback_query(filters.regex(r"^(dm_|ch_)"))
 async def handle_delivery_choice(client, callback_query):
@@ -229,11 +358,34 @@ async def cancel_deliver_cb(client, callback_query):
     await callback_query.answer("Stopping file delivery...", show_alert=True)
 
 async def deliver_content(client, message, url_hash, target_chat_id):
+    # 🚨 UNIFIED ROUTING LOGIC
     link_data = await links_collection.find_one({"hash": url_hash})
-    total_files = len(link_data["db_message_ids"])
-    db_message_ids = link_data["db_message_ids"]
+    media_data = await media_collection.find_one({"hash": url_hash})
     
-    # --- MongoDB Checkpointing Logic ---
+    db_message_ids = []
+    
+    if link_data:
+        db_message_ids = link_data.get("db_message_ids", [])
+    elif media_data and "message_id" in media_data:
+        db_message_ids = [media_data["message_id"]]
+    elif media_data:
+        # Legacy Fallback for media saved before the message_id upgrade
+        status_msg = await message.reply("📤 Delivering legacy file...")
+        try:
+            send_methods = {
+                "document": client.send_document, "video": client.send_video, 
+                "audio": client.send_audio, "photo": client.send_photo, "animation": client.send_animation
+            }
+            send_fn = send_methods.get(media_data.get("type", "document"), client.send_document)
+            await send_fn(target_chat_id, media_data["_id"])
+            return await status_msg.edit_text("✅ **Delivery Complete!**")
+        except Exception as e:
+            return await status_msg.edit_text(f"❌ Legacy delivery failed: {e}")
+
+    total_files = len(db_message_ids)
+    if total_files == 0:
+        return await message.reply("❌ Error: No files found in this link.")
+
     checkpoint = await active_deliveries.find_one({"hash": url_hash, "target": str(target_chat_id)})
     start_index = checkpoint["last_sent_index"] if checkpoint else 0
 
@@ -242,68 +394,67 @@ async def deliver_content(client, message, url_hash, target_chat_id):
     start_time = time.time()
     cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Delivery", callback_data=f"cancel_deliver_{url_hash}")]])
     
-    status_msg = await message.reply(
-        f"⏳ **Initializing Delivery** to {target_chat_id}...", 
-        reply_markup=cancel_kb
-    )
+    if start_index > 0:
+        status_msg = await message.reply(f"🔄 **Resuming Delivery** to {target_chat_id} from file {start_index}...", reply_markup=cancel_kb)
+    else:
+        await active_deliveries.insert_one({"hash": url_hash, "target": str(target_chat_id), "last_sent_index": 0})
+        status_msg = await message.reply(f"⏳ **Initializing Delivery** to {target_chat_id}...", reply_markup=cancel_kb)
     
     success_count = start_index
     remaining_files = db_message_ids[start_index:]
-    
-    # Detect if target is a Channel (starts with -100) or a User DM
     is_channel = str(target_chat_id).startswith("-100")
 
     # ==========================================
     # PATH A: ULTRA-FAST UPLOAD (FOR CHANNELS)
     # ==========================================
     if is_channel:
-        try:
-            source_peer = await client.resolve_peer(DB_CHANNEL_ID)
-            target_peer = await client.resolve_peer(target_chat_id)
-        except Exception as e:
-            return await status_msg.edit_text(f"❌ Error resolving destination channel. Am I an admin? {e}")
-
         chunk_size = 100
         for i in range(0, len(remaining_files), chunk_size):
             if active_processes.get(process_id):
-                await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**")
+                await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**\n(Click link again to resume later)")
                 del active_processes[process_id]
                 return
 
             chunk = remaining_files[i:i + chunk_size]
+
+            if not await ensure_peer_loaded(client, DB_CHANNEL_ID) or not await ensure_peer_loaded(client, target_chat_id):
+                await status_msg.edit_text(f"❌ Unable to load destination peer {target_chat_id}. Make sure I'm a member/admin.")
+                break
+
             try:
-                random_ids = [client.rnd_id() for _ in chunk]
-                await client.invoke(
-                    raw.functions.messages.ForwardMessages(
-                        from_peer=source_peer,
-                        id=chunk,
-                        to_peer=target_peer,
-                        random_id=random_ids,
-                        drop_author=True 
-                    )
+                await client.forward_messages(
+                    chat_id=target_chat_id,
+                    from_chat_id=DB_CHANNEL_ID,
+                    message_ids=chunk,
+                    disable_notification=True,
+                    drop_author=True
                 )
-                
+
                 success_count += len(chunk)
-                
-                # Checkpointing & Progress update
                 await active_deliveries.update_one(
                     {"hash": url_hash, "target": str(target_chat_id)},
                     {"$set": {"last_sent_index": success_count}},
                     upsert=True
                 )
-                
+
                 prog_str = get_progress_string(success_count, total_files, start_time)
                 try:
                     await status_msg.edit_text(f"🚀 **Fast-Uploading to Channel...**\n\n{prog_str}", reply_markup=cancel_kb)
                 except Exception:
                     pass
-                
-                await asyncio.sleep(2) # Protect API limits
-                
+
+                await asyncio.sleep(2)
+
             except FloodWait as e:
                 await asyncio.sleep(e.value)
             except Exception as e:
-                print(f"Skipping chunk: {e}")
+                try:
+                    await asyncio.sleep(1)
+                    await ensure_peer_loaded(client, target_chat_id, retries=2, delay=1)
+                    await client.forward_messages(chat_id=target_chat_id, from_chat_id=DB_CHANNEL_ID, message_ids=chunk, drop_author=True)
+                    success_count += len(chunk)
+                except Exception:
+                    continue
 
     # ==========================================
     # PATH B: SAFE DRIP-FEED (FOR USER DMs)
@@ -311,15 +462,21 @@ async def deliver_content(client, message, url_hash, target_chat_id):
     else:
         for idx, msg_id in enumerate(remaining_files, start=start_index + 1):
             if active_processes.get(process_id):
-                await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**")
+                await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**\n(Click link again to resume later)")
                 del active_processes[process_id]
                 return
 
             try:
-                await client.copy_message(chat_id=target_chat_id, from_chat_id=DB_CHANNEL_ID, message_id=msg_id)
+                await client.resolve_peer(DB_CHANNEL_ID)
+                
+                await client.copy_message(
+                    chat_id=target_chat_id, 
+                    from_chat_id=DB_CHANNEL_ID, 
+                    message_id=msg_id
+                )
                 success_count += 1
                 
-                if success_count % 50 == 0:
+                if success_count % 50 == 0 or success_count == total_files:
                     await active_deliveries.update_one(
                         {"hash": url_hash, "target": str(target_chat_id)},
                         {"$set": {"last_sent_index": success_count}},
@@ -333,15 +490,14 @@ async def deliver_content(client, message, url_hash, target_chat_id):
                     except Exception:
                         pass
 
-                await asyncio.sleep(0.5) # Mandatory 0.5s for DMs to prevent spam bans
+                await asyncio.sleep(0.05) 
                 
             except FloodWait as e:
                 await asyncio.sleep(e.value)
             except Exception as e:
-                await status_msg.reply_text(f"❌ Error sending file. Process paused.")
+                await status_msg.reply_text(f"❌ Error sending file. Process paused at {success_count}.\n\nRaw Error: `{e}`")
                 break
 
-    # --- Cleanup ---
     if process_id in active_processes:
         del active_processes[process_id]
             
@@ -350,16 +506,37 @@ async def deliver_content(client, message, url_hash, target_chat_id):
         final_str = get_progress_string(success_count, total_files, start_time)
         await status_msg.edit_text(f"✅ **Delivery Complete!**\n\n{final_str}")
 
-# --- Auto-Resume Boot Sequence ---
+
+# ==========================================
+# 🚨 BOOT SEQUENCE & AUTOMATED WARMUP 🚨
+# ==========================================
+async def warmup_peers():
+    try:
+        print("Loading peer cache...")
+        await app.get_chat(DB_CHANNEL_ID)
+        
+        async for dialog in app.get_dialogs():
+            pass
+            
+        print("✅ Peer cache loaded successfully")
+    except Exception as e:
+        print("Warmup failed:", e)
+
 async def resume_interrupted_deliveries():
-    """Finds any deliveries that were interrupted by a server restart and automatically resumes them."""
     cursor = active_deliveries.find({})
     async for delivery in cursor:
         url_hash = delivery["hash"]
-        target = delivery["target"]
         print(f"Server restart detected. Auto-resume requires user to click /start {url_hash} again to re-bind the DM status window.")
-        # Alternatively, you could auto-trigger the loop here, but it's safer to let the checkpoint wait for the user.
 
 if __name__ == "__main__":
-    print("Bot is starting with MTProto Chunking & MongoDB Checkpointing...")
-    app.run()
+    print("Bot starting...")
+    
+    app.start()
+    
+    app.loop.run_until_complete(warmup_peers())
+    app.loop.run_until_complete(resume_interrupted_deliveries())
+    
+    print("Bot ready")
+    
+    idle()
+    app.stop()
