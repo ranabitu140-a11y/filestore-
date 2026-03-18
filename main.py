@@ -24,8 +24,8 @@ db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client.bot_database
 links_collection = db.stored_links
 active_deliveries = db.active_deliveries
-media_collection = db.media # Stores single files
-auto_batch_collection = db.auto_batch # Stores the silent channel backup list
+media_collection = db.media 
+auto_batch_collection = db.auto_batch # Master list for all files
 
 # State and Process managers
 user_states = {}
@@ -82,72 +82,34 @@ def get_progress_string(current, total, start_time):
     )
 
 # ==========================================
-# 🚨 DUAL-ACTION CHANNEL LISTENER 🚨
+# 🚨 AUTO-BATCH COMMANDS & LISTENERS 🚨
 # ==========================================
 @app.on_message(filters.chat(DB_CHANNEL_ID))
 async def auto_index_channel_media(client, message):
     """
-    Listens to the DB Channel to do TWO things simultaneously:
-    1. Generate a permanent link for the individual file.
-    2. Add the file to the master Auto-Batch list.
+    Catches files YOU manually forward to the DB Channel, saving them to the master list.
     """
-    if message.media and message.media.value in ["document", "video", "audio", "photo", "animation"]:
-        
-        # --- ACTION 1: Single-File Backup ---
-        media = getattr(message, message.media.value)
-        file_id = media.file_id
-        file_unique_id = media.file_unique_id
-        media_type = message.media.value
-        file_name = getattr(media, "file_name", f"{media_type}_{file_unique_id}")
-        
-        url_hash = generate_hash()
-        
-        try:
-            await media_collection.insert_one({
-                "_id": file_id, 
-                "hash": url_hash,
-                "message_id": message.id, # Binds to unified delivery
-                "file_unique_id": file_unique_id,
-                "type": media_type,
-                "file_name": file_name,
-                "source_channel": DB_CHANNEL_ID,
-                "added_date": datetime.now().isoformat()
-            })
-            
-            bot_username = (await client.get_me()).username
-            shareable_link = f"https://t.me/{bot_username}?start={url_hash}"
-            
-            try:
-                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Copy Permanent Link", url=shareable_link)]])
-                await message.edit_reply_markup(reply_markup)
-            except Exception:
-                pass
-        except Exception:
-            pass
-            
-        # --- ACTION 2: Add to Auto-Batch Master List ---
+    if message.media:
         try:
             await auto_batch_collection.update_one(
                 {"_id": "master_backup"},
                 {"$addToSet": {"message_ids": message.id}},
                 upsert=True
             )
-            print(f"[Auto-Batch] Indexed Message ID: {message.id}")
+            print(f"[Auto-Batch] Indexed Manual Message ID: {message.id}")
         except Exception as e:
             print(f"[Auto-Batch] DB Error: {e}")
 
-# ==========================================
-# 🚨 AUTO-BATCH COMMANDS 🚨
-# ==========================================
 @app.on_message(filters.command("dbupload") & filters.private)
 async def db_upload_command(client, message):
-    """Packages the entire auto-saved database into a single shareable link."""
-    status = await message.reply("⏳ **Packaging auto-saved media...**")
+    """Packages the ENTIRE auto-saved database into a single shareable link."""
+    status = await message.reply("⏳ **Packaging ALL saved media from the database...**")
     
     doc = await auto_batch_collection.find_one({"_id": "master_backup"})
     if not doc or not doc.get("message_ids"):
-        return await status.edit_text("❌ **No media found.**\nUpload files to the DB Channel first, then try again.")
+        return await status.edit_text("❌ **No media found in the database.**\nRun a /batch or send files to the DB Channel first.")
     
+    # Sort IDs so they deliver in the exact order they were uploaded
     db_message_ids = sorted(list(doc["message_ids"])) 
     total_files = len(db_message_ids)
     
@@ -163,9 +125,9 @@ async def db_upload_command(client, message):
     shareable_link = f"https://t.me/{bot_username}?start={url_hash}"
 
     await status.edit_text(
-        f"✅ **Database Packaged Successfully!**\n\n"
-        f"📦 **Total Auto-Saved Files:** {total_files}\n\n"
-        f"🔗 **Your Unified Link:**\n`{shareable_link}`\n\n"
+        f"✅ **Entire Database Packaged Successfully!**\n\n"
+        f"📦 **Total Saved Files:** {total_files}\n\n"
+        f"🔗 **Your Master Link:**\n`{shareable_link}`\n\n"
         f"*(Tap the link to deliver all these files at once)*"
     )
 
@@ -173,7 +135,8 @@ async def db_upload_command(client, message):
 async def db_clear_command(client, message):
     """Empties the auto-batch MongoDB list for a fresh start."""
     await auto_batch_collection.delete_one({"_id": "master_backup"})
-    await message.reply("🗑️ **Auto-Backup Cleared!**\nAny new files sent to the DB channel will start a fresh list.")
+    await message.reply("🗑️ **Database Cleared!**\nYour master list is now empty. New batches will start fresh.")
+
 
 # ==========================================
 # 1. MANUAL BATCH & SINGLE UPLOAD WORKFLOW
@@ -194,22 +157,24 @@ async def handle_batch_messages(client, message):
         if message.media and message.media.value in ["document", "video", "audio", "photo", "animation"]:
             status = await message.reply("⏳ Uploading to DB Channel for permanent storage...")
             try:
-                # Copy to DB channel to make it immortal
                 copied_msg = await message.copy(DB_CHANNEL_ID)
                 
+                # Instantly add this to the master auto-batch list
+                await auto_batch_collection.update_one(
+                    {"_id": "master_backup"},
+                    {"$addToSet": {"message_ids": copied_msg.id}},
+                    upsert=True
+                )
+                
                 media = getattr(message, message.media.value)
-                file_unique_id = media.file_unique_id
-                media_type = message.media.value
-                file_name = getattr(media, "file_name", f"{media_type}_{file_unique_id}")
                 url_hash = generate_hash()
                 
                 await media_collection.insert_one({
                     "_id": media.file_id, 
                     "hash": url_hash,
                     "message_id": copied_msg.id,
-                    "file_unique_id": file_unique_id,
-                    "type": media_type,
-                    "file_name": file_name,
+                    "type": message.media.value,
+                    "file_name": getattr(media, "file_name", f"{message.media.value}_{media.file_unique_id}"),
                     "source_channel": DB_CHANNEL_ID,
                     "added_date": datetime.now().isoformat()
                 })
@@ -217,10 +182,8 @@ async def handle_batch_messages(client, message):
                 bot_username = (await client.get_me()).username
                 shareable_link = f"https://t.me/{bot_username}?start={url_hash}"
                 await status.edit_text(
-                    f"✅ **Single File Saved!**\n\n"
-                    f"**File:** `{file_name}`\n"
-                    f"**Type:** `{media_type}`\n\n"
-                    f"🔗 **Your Permanent Link:**\n`{shareable_link}`"
+                    f"✅ **Single File Saved & Added to Database!**\n\n"
+                    f"🔗 **Your Permanent Single Link:**\n`{shareable_link}`"
                 )
             except Exception as e:
                 await status.edit_text(f"❌ Error saving media: {e}")
@@ -285,9 +248,20 @@ async def handle_batch_messages(client, message):
                         disable_notification=True,
                         drop_author=True
                     )
+                    
+                    # 🚨 FIXED: Forcefully push the bot's own uploads into the master list
+                    chunk_db_ids = []
                     for msg in forwarded_msgs:
                         if msg and msg.id:
                             db_message_ids.append(msg.id)
+                            chunk_db_ids.append(msg.id)
+                            
+                    if chunk_db_ids:
+                        await auto_batch_collection.update_one(
+                            {"_id": "master_backup"},
+                            {"$addToSet": {"message_ids": {"$each": chunk_db_ids}}},
+                            upsert=True
+                        )
                             
                 except Exception as e_forward:
                     random_ids = [client.rnd_id() for _ in chunk]
@@ -300,9 +274,19 @@ async def handle_batch_messages(client, message):
                             drop_author=True
                         )
                     )
+                    
+                    chunk_db_ids = []
                     for update in result.updates:
                         if hasattr(update, "message") and hasattr(update.message, "id"):
                             db_message_ids.append(update.message.id)
+                            chunk_db_ids.append(update.message.id)
+                            
+                    if chunk_db_ids:
+                        await auto_batch_collection.update_one(
+                            {"_id": "master_backup"},
+                            {"$addToSet": {"message_ids": {"$each": chunk_db_ids}}},
+                            upsert=True
+                        )
 
                 processed_count += len(chunk)
                 prog_str = get_progress_string(processed_count, total_files, start_time)
@@ -408,7 +392,6 @@ async def deliver_content(client, message, url_hash, target_chat_id):
     
     db_message_ids = []
     
-    # UNIFIED ID RESOLUTION
     if link_data:
         db_message_ids = link_data.get("db_message_ids", [])
     elif media_data and "message_id" in media_data:
