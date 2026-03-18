@@ -24,8 +24,7 @@ db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client.bot_database
 links_collection = db.stored_links
 active_deliveries = db.active_deliveries
-media_collection = db.media 
-auto_batch_collection = db.auto_batch # Master list for all files
+media_collection = db.media # 🚨 THE IMMORTAL FILE ID DATABASE
 
 # State and Process managers
 user_states = {}
@@ -82,42 +81,62 @@ def get_progress_string(current, total, start_time):
     )
 
 # ==========================================
-# 🚨 AUTO-BATCH COMMANDS & LISTENERS 🚨
+# 🚨 IMMORTAL MEDIA EXTRACTION ENGINE 🚨
 # ==========================================
-@app.on_message(filters.chat(DB_CHANNEL_ID))
-async def auto_index_channel_media(client, message):
-    """
-    Catches files YOU manually forward to the DB Channel, saving them to the master list.
-    """
-    if message.media:
+async def extract_and_save_media(msg, source_name="DB Channel"):
+    """Extracts the immortal file_id from a message and saves it to MongoDB."""
+    if not msg or not msg.media: return False
+    mt = msg.media.value
+    if mt in ["document", "video", "audio", "photo", "animation"]:
+        media = getattr(msg, mt)
+        fid = media.file_id
+        uid = media.file_unique_id
+        fname = getattr(media, "file_name", f"{mt}_{uid}")
         try:
-            await auto_batch_collection.update_one(
-                {"_id": "master_backup"},
-                {"$addToSet": {"message_ids": message.id}},
+            await media_collection.update_one(
+                {"_id": fid},
+                {"$set": {
+                    "file_unique_id": uid,
+                    "type": mt,
+                    "file_name": fname,
+                    "source_channel": str(source_name),
+                    "added_date": datetime.now().isoformat()
+                }},
                 upsert=True
             )
-            print(f"[Auto-Batch] Indexed Manual Message ID: {message.id}")
+            return True
         except Exception as e:
-            print(f"[Auto-Batch] DB Error: {e}")
+            print(f"[DB Error] Could not save media {fid}: {e}")
+    return False
 
+@app.on_message(filters.chat(DB_CHANNEL_ID))
+async def auto_index_channel_media(client, message):
+    """Passively listens to the DB Channel and saves anything manually dropped there."""
+    await extract_and_save_media(message, source_name="Manual Drop")
+
+# ==========================================
+# 🚨 DATABASE PACKAGING COMMANDS 🚨
+# ==========================================
 @app.on_message(filters.command("dbupload") & filters.private)
 async def db_upload_command(client, message):
-    """Packages the ENTIRE auto-saved database into a single shareable link."""
-    status = await message.reply("⏳ **Packaging ALL saved media from the database...**")
+    """Packages every single immortal file_id in the MongoDB into a single delivery link."""
+    status = await message.reply("⏳ **Packaging all media from MongoDB...**")
     
-    doc = await auto_batch_collection.find_one({"_id": "master_backup"})
-    if not doc or not doc.get("message_ids"):
-        return await status.edit_text("❌ **No media found in the database.**\nRun a /batch or send files to the DB Channel first.")
+    cursor = media_collection.find({})
+    all_media = await cursor.to_list(length=None)
     
-    # Sort IDs so they deliver in the exact order they were uploaded
-    db_message_ids = sorted(list(doc["message_ids"])) 
-    total_files = len(db_message_ids)
+    if not all_media:
+        return await status.edit_text("❌ **MongoDB is empty.**\nRun a /batch or send files to the DB Channel first.")
     
+    total_files = len(all_media)
     url_hash = generate_hash()
+    
+    # 🚨 Convert the database documents into a lightweight delivery payload
+    payload = [{"file_id": doc["_id"], "type": doc["type"]} for doc in all_media]
     
     await links_collection.insert_one({
         "hash": url_hash,
-        "db_message_ids": db_message_ids,
+        "immortal_files": payload, # Saves as immortal files instead of message_ids
         "creator_id": message.from_user.id
     })
 
@@ -125,18 +144,17 @@ async def db_upload_command(client, message):
     shareable_link = f"https://t.me/{bot_username}?start={url_hash}"
 
     await status.edit_text(
-        f"✅ **Entire Database Packaged Successfully!**\n\n"
-        f"📦 **Total Saved Files:** {total_files}\n\n"
+        f"✅ **Database Packaged Successfully!**\n\n"
+        f"📦 **Total Immortal Files:** {total_files}\n\n"
         f"🔗 **Your Master Link:**\n`{shareable_link}`\n\n"
-        f"*(Tap the link to deliver all these files at once)*"
+        f"*(Tap the link to deliver all these files to your DM or Channel)*"
     )
 
 @app.on_message(filters.command("dbclear") & filters.private)
 async def db_clear_command(client, message):
-    """Empties the auto-batch MongoDB list for a fresh start."""
-    await auto_batch_collection.delete_one({"_id": "master_backup"})
-    await message.reply("🗑️ **Database Cleared!**\nYour master list is now empty. New batches will start fresh.")
-
+    """Empties the media MongoDB list for a fresh start."""
+    deleted_count = (await media_collection.delete_many({})).deleted_count
+    await message.reply(f"🗑️ **Database Cleared!**\nDeleted {deleted_count} files. New batches will start fresh.")
 
 # ==========================================
 # 1. MANUAL BATCH & SINGLE UPLOAD WORKFLOW
@@ -155,35 +173,25 @@ async def handle_batch_messages(client, message):
     # --- PM SINGLE UPLOAD INTERCEPTOR ---
     if not state_data:
         if message.media and message.media.value in ["document", "video", "audio", "photo", "animation"]:
-            status = await message.reply("⏳ Uploading to DB Channel for permanent storage...")
+            status = await message.reply("⏳ Extracting Immortal ID...")
             try:
                 copied_msg = await message.copy(DB_CHANNEL_ID)
-                
-                # Instantly add this to the master auto-batch list
-                await auto_batch_collection.update_one(
-                    {"_id": "master_backup"},
-                    {"$addToSet": {"message_ids": copied_msg.id}},
-                    upsert=True
-                )
+                await extract_and_save_media(copied_msg, source_name="Direct PM")
                 
                 media = getattr(message, message.media.value)
                 url_hash = generate_hash()
                 
-                await media_collection.insert_one({
-                    "_id": media.file_id, 
+                # Single links act exactly like /dbupload links, just with 1 item.
+                await links_collection.insert_one({
                     "hash": url_hash,
-                    "message_id": copied_msg.id,
-                    "type": message.media.value,
-                    "file_name": getattr(media, "file_name", f"{message.media.value}_{media.file_unique_id}"),
-                    "source_channel": DB_CHANNEL_ID,
-                    "added_date": datetime.now().isoformat()
+                    "immortal_files": [{"file_id": media.file_id, "type": message.media.value}]
                 })
                 
                 bot_username = (await client.get_me()).username
                 shareable_link = f"https://t.me/{bot_username}?start={url_hash}"
                 await status.edit_text(
-                    f"✅ **Single File Saved & Added to Database!**\n\n"
-                    f"🔗 **Your Permanent Single Link:**\n`{shareable_link}`"
+                    f"✅ **Single Immortal File Saved!**\n\n"
+                    f"🔗 **Your Link:**\n`{shareable_link}`"
                 )
             except Exception as e:
                 await status.edit_text(f"❌ Error saving media: {e}")
@@ -237,7 +245,7 @@ async def handle_batch_messages(client, message):
                 ok1 = await ensure_peer_loaded(client, source_chat_id)
                 ok2 = await ensure_peer_loaded(client, DB_CHANNEL_ID)
                 if not ok1 or not ok2:
-                    await status_msg.edit_text("❌ Unable to load channel peers. Please ensure bot is in both channels.")
+                    await status_msg.edit_text("❌ Unable to load channel peers.")
                     break
 
                 try:
@@ -248,20 +256,11 @@ async def handle_batch_messages(client, message):
                         disable_notification=True,
                         drop_author=True
                     )
-                    
-                    # 🚨 FIXED: Forcefully push the bot's own uploads into the master list
-                    chunk_db_ids = []
+                    # 🚨 FIXED: Forcefully push the batched files into the immortal MongoDB collection
                     for msg in forwarded_msgs:
                         if msg and msg.id:
                             db_message_ids.append(msg.id)
-                            chunk_db_ids.append(msg.id)
-                            
-                    if chunk_db_ids:
-                        await auto_batch_collection.update_one(
-                            {"_id": "master_backup"},
-                            {"$addToSet": {"message_ids": {"$each": chunk_db_ids}}},
-                            upsert=True
-                        )
+                            await extract_and_save_media(msg, source_name=f"Batch {url_hash if 'url_hash' in locals() else 'Upload'}")
                             
                 except Exception as e_forward:
                     random_ids = [client.rnd_id() for _ in chunk]
@@ -275,18 +274,15 @@ async def handle_batch_messages(client, message):
                         )
                     )
                     
-                    chunk_db_ids = []
-                    for update in result.updates:
-                        if hasattr(update, "message") and hasattr(update.message, "id"):
-                            db_message_ids.append(update.message.id)
-                            chunk_db_ids.append(update.message.id)
-                            
-                    if chunk_db_ids:
-                        await auto_batch_collection.update_one(
-                            {"_id": "master_backup"},
-                            {"$addToSet": {"message_ids": {"$each": chunk_db_ids}}},
-                            upsert=True
-                        )
+                    raw_msg_ids = [u.message.id for u in result.updates if hasattr(u, "message") and hasattr(u.message, "id")]
+                    if raw_msg_ids:
+                        db_message_ids.extend(raw_msg_ids)
+                        # Fetch the raw messages so we can extract their file_ids
+                        try:
+                            fetched_msgs = await client.get_messages(DB_CHANNEL_ID, raw_msg_ids)
+                            for msg in fetched_msgs:
+                                await extract_and_save_media(msg, source_name="Batch Raw Fallback")
+                        except Exception: pass
 
                 processed_count += len(chunk)
                 prog_str = get_progress_string(processed_count, total_files, start_time)
@@ -311,7 +307,7 @@ async def handle_batch_messages(client, message):
         url_hash = generate_hash()
         await links_collection.insert_one({
             "hash": url_hash,
-            "db_message_ids": db_message_ids,
+            "db_message_ids": db_message_ids, # Standard message_ids for fast channel chunking
             "creator_id": user_id
         })
 
@@ -345,9 +341,7 @@ async def start_command(client, message):
         url_hash = message.command[1]
         
         link_data = await links_collection.find_one({"hash": url_hash})
-        media_data = await media_collection.find_one({"hash": url_hash})
-        
-        if link_data or media_data:
+        if link_data:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("Send to my DM 📩", callback_data=f"dm_{url_hash}")],
                 [InlineKeyboardButton("Send to my Channel 📢", callback_data=f"ch_{url_hash}")]
@@ -356,7 +350,7 @@ async def start_command(client, message):
         
         await message.reply("❌ Invalid or expired link.")
     else:
-        await message.reply("Hello! I am a permanent file store bot.\n\nUse `/batch` to manually clone channels, or `/dbupload` to package everything I've auto-saved from the DB Channel.")
+        await message.reply("Hello! I am a permanent file store bot.\n\nUse `/batch` to clone channels, or `/dbupload` to package the immortal database.")
 
 @app.on_callback_query(filters.regex(r"^(dm_|ch_)"))
 async def handle_delivery_choice(client, callback_query):
@@ -388,16 +382,14 @@ async def cancel_deliver_cb(client, callback_query):
 
 async def deliver_content(client, message, url_hash, target_chat_id):
     link_data = await links_collection.find_one({"hash": url_hash})
-    media_data = await media_collection.find_one({"hash": url_hash})
-    
-    db_message_ids = []
-    
-    if link_data:
-        db_message_ids = link_data.get("db_message_ids", [])
-    elif media_data and "message_id" in media_data:
-        db_message_ids = [media_data["message_id"]]
+    if not link_data:
+        return await message.reply("❌ Error: Link data not found.")
+        
+    # 🚨 LOGIC SPLIT: Determine if payload is fast message_ids or immortal file_ids
+    is_immortal = "immortal_files" in link_data
+    files_list = link_data["immortal_files"] if is_immortal else link_data.get("db_message_ids", [])
+    total_files = len(files_list)
 
-    total_files = len(db_message_ids)
     if total_files == 0:
         return await message.reply("❌ Error: No files found in this link.")
 
@@ -416,24 +408,24 @@ async def deliver_content(client, message, url_hash, target_chat_id):
         status_msg = await message.reply(f"⏳ **Initializing Delivery** to {target_chat_id}...", reply_markup=cancel_kb)
     
     success_count = start_index
-    remaining_files = db_message_ids[start_index:]
+    remaining_files = files_list[start_index:]
     is_channel = str(target_chat_id).startswith("-100")
 
     # ==========================================
-    # PATH A: ULTRA-FAST UPLOAD (FOR CHANNELS)
+    # PATH A: ULTRA-FAST UPLOAD (Channels + Message_ids ONLY)
     # ==========================================
-    if is_channel:
+    if is_channel and not is_immortal:
         chunk_size = 100
         for i in range(0, len(remaining_files), chunk_size):
             if active_processes.get(process_id):
-                await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**\n(Click link again to resume later)")
+                await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**")
                 del active_processes[process_id]
                 return
 
             chunk = remaining_files[i:i + chunk_size]
 
             if not await ensure_peer_loaded(client, DB_CHANNEL_ID) or not await ensure_peer_loaded(client, target_chat_id):
-                await status_msg.edit_text(f"❌ Unable to load destination peer {target_chat_id}. Make sure I'm a member/admin.")
+                await status_msg.edit_text(f"❌ Unable to load destination peer {target_chat_id}.")
                 break
 
             try:
@@ -455,40 +447,46 @@ async def deliver_content(client, message, url_hash, target_chat_id):
                 prog_str = get_progress_string(success_count, total_files, start_time)
                 try:
                     await status_msg.edit_text(f"🚀 **Fast-Uploading to Channel...**\n\n{prog_str}", reply_markup=cancel_kb)
-                except Exception:
-                    pass
+                except Exception: pass
 
                 await asyncio.sleep(2)
 
             except FloodWait as e:
                 await asyncio.sleep(e.value)
-            except Exception as e:
+            except Exception:
                 try:
                     await asyncio.sleep(1)
                     await ensure_peer_loaded(client, target_chat_id, retries=2, delay=1)
                     await client.forward_messages(chat_id=target_chat_id, from_chat_id=DB_CHANNEL_ID, message_ids=chunk, drop_author=True)
                     success_count += len(chunk)
-                except Exception:
-                    continue
+                except Exception: continue
 
     # ==========================================
-    # PATH B: SAFE DRIP-FEED (FOR USER DMs)
+    # PATH B: DRIP-FEED UPLOAD (DMs or Immortal File_IDs)
     # ==========================================
     else:
-        for idx, msg_id in enumerate(remaining_files, start=start_index + 1):
+        for idx, item in enumerate(remaining_files, start=start_index + 1):
             if active_processes.get(process_id):
-                await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**\n(Click link again to resume later)")
+                await status_msg.edit_text(f"❌ **Delivery Cancelled at file {success_count}.**")
                 del active_processes[process_id]
                 return
 
             try:
-                await client.resolve_peer(DB_CHANNEL_ID)
-                
-                await client.copy_message(
-                    chat_id=target_chat_id, 
-                    from_chat_id=DB_CHANNEL_ID, 
-                    message_id=msg_id
-                )
+                # If Immortal, use direct file sending (Indestructible backup)
+                if is_immortal:
+                    file_id = item["file_id"]
+                    media_type = item["type"]
+                    send_methods = {
+                        "document": client.send_document, "video": client.send_video,
+                        "audio": client.send_audio, "photo": client.send_photo, "animation": client.send_animation
+                    }
+                    send_fn = send_methods.get(media_type, client.send_document)
+                    await send_fn(target_chat_id, file_id)
+                # If Standard Batch, use copy_message
+                else:
+                    await client.resolve_peer(DB_CHANNEL_ID)
+                    await client.copy_message(target_chat_id, DB_CHANNEL_ID, item)
+                    
                 success_count += 1
                 
                 if success_count % 50 == 0 or success_count == total_files:
@@ -501,9 +499,8 @@ async def deliver_content(client, message, url_hash, target_chat_id):
                 if success_count % 10 == 0 or success_count == total_files:
                     prog_str = get_progress_string(success_count, total_files, start_time)
                     try:
-                        await status_msg.edit_text(f"📥 **Sending to DM...**\n\n{prog_str}", reply_markup=cancel_kb)
-                    except Exception:
-                        pass
+                        await status_msg.edit_text(f"📥 **Sending files...**\n\n{prog_str}", reply_markup=cancel_kb)
+                    except Exception: pass
 
                 await asyncio.sleep(0.05) 
                 
