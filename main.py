@@ -56,6 +56,11 @@ async def ensure_peer_loaded(client, chat_id, retries=3, delay=1.0):
             return True
         except Exception as e:
             print(f"[warmup] attempt {attempt} failed for {chat_id}: {e}")
+            try:
+                # Force Pyrogram to fetch recent dialogs to populate the peer cache
+                async for _ in client.get_dialogs(limit=50): pass
+            except Exception: pass
+            
             if attempt < retries:
                 await asyncio.sleep(delay)
     return False
@@ -761,7 +766,13 @@ async def warmup_peers():
         async for db_chan in db_channels_collection.find({}):
             DB_CHANNELS_CACHE.add(db_chan["channel_id"])
             
-        print("Loading peer cache...")
+        print("Loading peer cache via dialogs...")
+        # Fetch first 100 dialogs to populate the peer cache BEFORE trying get_chat
+        count = 0
+        async for dialog in app.get_dialogs():
+            count += 1
+            if count >= 100: break
+            
         if DB_CHANNEL_ID != 0:
             try: await app.get_chat(DB_CHANNEL_ID)
             except Exception: pass
@@ -769,9 +780,6 @@ async def warmup_peers():
         for db_chan in DB_CHANNELS_CACHE:
             try: await app.get_chat(db_chan)
             except Exception: pass
-            
-        async for dialog in app.get_dialogs():
-            pass
             
         print("✅ Peer cache loaded successfully")
     except Exception as e:
