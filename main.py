@@ -356,8 +356,12 @@ async def db_upload_command(client, message):
     total_files = len(all_media)
     url_hash = generate_hash()
     
-    # 🔥 FIX: doc["file_id"] not doc["_id"] — _id is now file_unique_id
-    payload = [{"file_id": doc["file_id"], "type": doc["type"]} for doc in all_media if doc.get("file_id")]
+    # Build payload: for NEW records use doc["file_id"]; for OLD records _id IS the file_id
+    payload = [
+        {"file_id": doc.get("file_id") or doc["_id"], "type": doc["type"]}
+        for doc in all_media
+        if doc.get("file_id") or doc.get("_id")
+    ]
     
     await links_collection.insert_one({
         "hash": url_hash,
@@ -381,14 +385,17 @@ async def dedupe_cmd(client, message):
     if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
     status = await message.reply("🔍 **Scanning for duplicates in database...**\n⏳ This may take a while for large collections.")
 
-    # Group by file_unique_id — after the fix, _id IS file_unique_id, so duplicates
-    # can only exist in OLD data where _id was file_id. We scan both fields.
+    # Group by file_unique_id field.
+    # Old records: _id=file_id, file_unique_id stored as a field.
+    # New records: _id=file_unique_id, file_unique_id ALSO stored as a field (after fix).
+    # Records with NO file_unique_id field at all are grouped under _id:null — we SKIP those
+    # to avoid accidentally deleting orphaned records that can't be compared.
     pipeline = [
+        {"$match": {"file_unique_id": {"$exists": True, "$ne": None}}},  # skip null-uid records
         {"$group": {
             "_id": "$file_unique_id",
             "all_doc_ids": {"$push": "$_id"},
-            "sources": {"$push": "$source_channel"},
-            "file_ids": {"$push": "$file_id"},
+            "sources": {"$push": {"$ifNull": ["$source_channel", ""]}},
             "count": {"$sum": 1}
         }},
         {"$match": {"count": {"$gt": 1}}}
@@ -396,35 +403,44 @@ async def dedupe_cmd(client, message):
     cursor = media_collection.aggregate(pipeline)
     dup_groups = await cursor.to_list(length=None)
 
+    # Also count records with no file_unique_id for reporting
+    orphan_count = await media_collection.count_documents(
+        {"$or": [{"file_unique_id": {"$exists": False}}, {"file_unique_id": None}]}
+    )
+
     if not dup_groups:
         total = await media_collection.count_documents({})
+        orphan_note = f"\n⚠️ **{orphan_count} orphaned records** (no file_unique_id — safe, not touched)" if orphan_count else ""
         return await status.edit_text(
             f"✅ **No duplicates found!**\n"
-            f"📦 Database has **{total}** unique files — all clean."
+            f"📦 Database has **{total}** unique files — all clean.{orphan_note}"
         )
 
     total_dups = sum(g["count"] - 1 for g in dup_groups)
+    orphan_note = f" | ⚠️ {orphan_count} orphaned (skipped)" if orphan_count else ""
     await status.edit_text(
-        f"🗑️ **Found {len(dup_groups)} duplicate groups** ({total_dups} extra entries)\n"
+        f"🗑️ **Found {len(dup_groups)} duplicate groups** ({total_dups} extra entries{orphan_note})\n"
         f"⏳ Removing extras, keeping best source info..."
     )
 
     removed = 0
-    LOW_PRIORITY_SOURCES = {"Manual Drop", "Batch Raw Fallback", "Direct PM", "DB Channel", "None", ""}
+    LOW_PRIORITY_SOURCES = {"Manual Drop", "Batch Raw Fallback", "Direct PM", "DB Channel", "None", "", "none"}
 
     for group in dup_groups:
         all_ids = group["all_doc_ids"]
         sources = group["sources"]
-        # Pick the ID with the best (real channel) source to KEEP
+        # Pick the doc with the best (real channel ID) source to KEEP
+        # Default: keep index 0 (safe even if all sources are low-priority)
         best_idx = 0
         for idx, src in enumerate(sources):
-            if str(src) not in LOW_PRIORITY_SOURCES:
+            if str(src or "").strip() not in LOW_PRIORITY_SOURCES:
                 best_idx = idx
                 break
         keep_id = all_ids[best_idx]
         delete_ids = [d for d in all_ids if d != keep_id]
-        await media_collection.delete_many({"_id": {"$in": delete_ids}})
-        removed += len(delete_ids)
+        if delete_ids:
+            await media_collection.delete_many({"_id": {"$in": delete_ids}})
+            removed += len(delete_ids)
 
     total_after = await media_collection.count_documents({})
     await status.edit_text(
