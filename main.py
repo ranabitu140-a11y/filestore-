@@ -189,7 +189,8 @@ async def help_cmd(client, message):
         "• `/adddb <channel_id>` - Add a new dynamic DB channel.\n"
         "• `/deldb <channel_id>` - Remove a dynamic DB channel.\n"
         "• `/dedupe` - Scan & remove duplicate files from database.\n"
-        "• `/reassign <old_source> | <channel_id> [title]` - Move orphaned files to a real channel.\n\n"
+        "• `/reassign <old_source> | <channel_id> [title]` - Move orphaned files to a real channel.\n"
+        "• `/makeimmortal` - Convert ALL existing links & label orphaned files as 'Free Files'.\n\n"
         "**Owner Commands:**\n"
         "• `/addadmin <user_id>` - Add an admin.\n"
         "• `/deladmin <user_id>` - Remove an admin.\n"
@@ -513,10 +514,132 @@ async def reassign_cmd(client, message):
     )
 
 
+@app.on_message(filters.command("makeimmortal") & filters.private)
+async def make_immortal_cmd(client, message):
+    """Converts ALL existing stored_links that use db_message_ids into immortal links.
+    After this runs, every link survives DB channel deletion forever.
+    Also labels orphaned 'Batch Raw Fallback' files as 'Free Files'.
+    """
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+
+    status = await message.reply(
+        "⚡ **Immortalization Started...**\n\n"
+        "**Step 1/2:** Labelling orphaned files as *Free Files*...\n"
+        "**Step 2/2:** Converting old links to immortal format...\n\n"
+        "⏳ Please wait."
+    )
+
+    # ── STEP 1: Label all orphaned generic-source files as "Free Files" ──
+    orphan_sources = ["Batch Raw Fallback", "Manual Drop", "DB Channel"]
+    free_count = 0
+    for src in orphan_sources:
+        res = await media_collection.update_many(
+            {"source_channel": src},
+            {"$set": {"source_channel": "free_files", "source_title": "Free Files"}}
+        )
+        free_count += res.modified_count
+
+    step1_note = f"✅ Labelled **{free_count}** orphaned files as **Free Files**.\n" if free_count else "✅ No orphaned files to relabel.\n"
+
+    # ── STEP 2: Convert old stored_links to immortal format ──
+    cursor = links_collection.find({
+        "db_message_ids": {"$exists": True},
+        "$or": [
+            {"immortal_files": {"$exists": False}},
+            {"immortal_files": {"$size": 0}}
+        ]
+    })
+    links_to_convert = await cursor.to_list(length=None)
+
+    if not links_to_convert:
+        return await status.edit_text(
+            f"{step1_note}\n"
+            "✅ **All links are already immortal!**\n\n"
+            "💡 Run `/url` to see your updated channel list."
+        )
+
+    total_links = len(links_to_convert)
+    converted = 0
+    failed = 0
+    total_files_immortalized = 0
+
+    await status.edit_text(
+        f"{step1_note}\n"
+        f"⚡ **Found {total_links} old links to convert...**\n"
+        "⏳ Fetching file IDs from DB channel..."
+    )
+
+    for idx, link_doc in enumerate(links_to_convert):
+        msg_ids = link_doc.get("db_message_ids", [])
+        db_channel = link_doc.get("db_channel_id", DB_CHANNEL_ID)
+
+        if not msg_ids or not db_channel:
+            failed += 1
+            continue
+
+        try:
+            await ensure_peer_loaded(client, db_channel)
+            immortal_files = []
+
+            for i in range(0, len(msg_ids), 100):
+                chunk = msg_ids[i:i + 100]
+                try:
+                    msgs = await client.get_messages(db_channel, chunk)
+                    for msg in msgs:
+                        if not msg or msg.empty or not msg.media:
+                            continue
+                        mt = msg.media.value
+                        if mt in ["document", "video", "audio", "photo", "animation"]:
+                            media_obj = getattr(msg, mt)
+                            immortal_files.append({"file_id": media_obj.file_id, "type": mt})
+                    await asyncio.sleep(0.5)
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value + 1)
+                except Exception as ce:
+                    print(f"Chunk error for link {link_doc.get('hash','?')}: {ce}")
+
+            if immortal_files:
+                await links_collection.update_one(
+                    {"_id": link_doc["_id"]},
+                    {"$set": {"immortal_files": immortal_files}}
+                )
+                converted += 1
+                total_files_immortalized += len(immortal_files)
+            else:
+                failed += 1  # Messages already deleted from DB channel
+
+        except Exception as e:
+            print(f"Link conversion error: {e}")
+            failed += 1
+
+        if (idx + 1) % 3 == 0 or (idx + 1) == total_links:
+            try:
+                await status.edit_text(
+                    f"{step1_note}\n"
+                    f"⚡ **Converting links... {idx+1}/{total_links}**\n\n"
+                    f"✅ Converted: {converted}\n"
+                    f"❌ Failed (msgs deleted): {failed}\n"
+                    f"📦 Files immortalized: {total_files_immortalized}"
+                )
+            except Exception:
+                pass
+
+    await status.edit_text(
+        f"✅ **Immortalization Complete!**\n\n"
+        f"🏷️ **Orphaned files labelled:** {free_count} → **Free Files**\n"
+        f"🔗 **Links converted:** {converted}/{total_links}\n"
+        f"📦 **Total files immortalized:** {total_files_immortalized}\n"
+        f"❌ **Failed** (DB msgs already gone): {failed}\n\n"
+        f"💡 Run `/url` to see your updated channels.\n"
+        f"⚠️ Failed links had their DB channel messages already deleted —\n"
+        f"use `/dbupload` to re-package from MongoDB instead."
+    )
+
 
 # ==========================================
 # 1. MANUAL BATCH & SINGLE UPLOAD WORKFLOW
 # ==========================================
+
 
 @app.on_message(filters.command("batch") & filters.private)
 async def start_batch(client, message):
