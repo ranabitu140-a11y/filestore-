@@ -532,12 +532,12 @@ async def handle_batch_messages(client, message):
                     await asyncio.sleep(2)
                     break  # Chunk successful, break out of the while True retry loop
 
-            except FloodWait as e:
-                # If we get rate limited, sleep and the while True loop will try this chunk again!
-                await asyncio.sleep(e.value + 1)
-            except Exception as e:
-                print(f"Batch chunk error: {e}")
-                break  # For non-floodwait errors, skip the chunk to avoid infinite loops
+                except FloodWait as e:
+                    # If we get rate limited, sleep and the while True loop will try this chunk again!
+                    await asyncio.sleep(e.value + 1)
+                except Exception as e:
+                    print(f"Batch chunk error: {e}")
+                    break  # For non-floodwait errors, skip the chunk to avoid infinite loops
             
         del active_processes[process_id]
 
