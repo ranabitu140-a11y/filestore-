@@ -423,21 +423,65 @@ async def handle_batch_messages(client, message):
         status_msg = await message.reply("⏳ **Initializing batch process...**", reply_markup=cancel_kb)
         
         db_message_ids = []
+        immortal_files = []  # 🔥 FIX: Also store file_ids so links survive DB channel edits/deletions
         message_ids_to_process = list(range(first_msg_id, last_msg_id + 1))
-        total_files = len(message_ids_to_process)
+        total_msgs = len(message_ids_to_process)   # total message ID range (includes non-media)
+        media_count = 0                             # only actual media processed
+        skipped_count = 0                           # duplicates skipped
         chunk_size = 100 
         
         start_time = time.time()
-        processed_count = 0
+        processed_count = 0   # tracks position in message_ids_to_process for ETA display
         is_cancelled = False
 
-        for i in range(0, total_files, chunk_size):
+        for i in range(0, total_msgs, chunk_size):
             if active_processes.get(process_id):
                 is_cancelled = True
                 break
 
             chunk = message_ids_to_process[i:i + chunk_size]
             original_chunk_len = len(chunk)
+
+            # --- DUPLICATE FILTERING (done BEFORE entering while True) ---
+            # BUG FIX: Was inside while True → `continue` would re-enter while True forever
+            # on all-duplicate chunks instead of advancing to the next outer for-loop chunk.
+            all_duplicates = False
+            try:
+                fetched_msgs = await client.get_messages(source_chat_id, chunk)
+                valid_ids = []
+                for msg in fetched_msgs:
+                    if not msg or msg.empty or not msg.media:
+                        continue
+                    mt = msg.media.value
+                    if mt in ["document", "video", "audio", "photo", "animation"]:
+                        media_obj = getattr(msg, mt)
+                        if hasattr(media_obj, "file_unique_id"):
+                            exists = await media_collection.find_one({"file_unique_id": media_obj.file_unique_id})
+                            if exists:
+                                skipped_count += 1
+                                continue
+                    valid_ids.append(msg.id)
+
+                if not valid_ids:
+                    # Entire chunk is duplicates — advance and skip
+                    all_duplicates = True
+                    processed_count += original_chunk_len
+                    prog_str = get_progress_string(processed_count, total_msgs, start_time)
+                    try:
+                        await status_msg.edit_text(
+                            f"🔄 **Skipped {skipped_count} duplicates so far...**\n\n{prog_str}",
+                            reply_markup=cancel_kb
+                        )
+                    except Exception:
+                        pass
+                else:
+                    chunk = valid_ids  # Only forward the non-duplicate IDs
+            except Exception as filter_err:
+                print(f"Duplicate check error: {filter_err}")
+            # --- END DUPLICATE FILTERING ---
+
+            if all_duplicates:
+                continue  # ✅ Now this correctly continues the outer FOR loop
 
             while True:
                 try:
@@ -452,37 +496,6 @@ async def handle_batch_messages(client, message):
                         await status_msg.edit_text("❌ Unable to load channel peers.")
                         break
 
-                    chunk_len = len(chunk)
-
-                    # --- DUPLICATE FILTERING ---
-                    try:
-                        fetched_msgs = await client.get_messages(source_chat_id, chunk)
-                        valid_chunk = []
-                        for msg in fetched_msgs:
-                            if not msg or msg.empty or not msg.media:
-                                continue
-                            mt = msg.media.value
-                            if mt in ["document", "video", "audio", "photo", "animation"]:
-                                media = getattr(msg, mt)
-                                if hasattr(media, "file_unique_id"):
-                                    exists = await media_collection.find_one({"file_unique_id": media.file_unique_id})
-                                    if exists:
-                                        continue
-                            valid_chunk.append(msg.id)
-                            
-                        if not valid_chunk:
-                            processed_count += chunk_len
-                            prog_str = get_progress_string(processed_count, total_files, start_time)
-                            try:
-                                await status_msg.edit_text(f"🔄 **Skipped {chunk_len} duplicates...**\n\n{prog_str}", reply_markup=cancel_kb)
-                            except Exception: pass
-                            continue
-                        
-                        chunk = valid_chunk
-                    except Exception as filter_err:
-                        print(f"Duplicate check error: {filter_err}")
-                    # --- END DUPLICATE FILTERING ---
-
                     try:
                         forwarded_msgs = await client.forward_messages(
                             chat_id=db_channel,
@@ -491,12 +504,17 @@ async def handle_batch_messages(client, message):
                             disable_notification=True,
                             drop_author=True
                         )
-                        # 🚨 FIXED: Forcefully push the batched files into the immortal MongoDB collection
                         for msg in forwarded_msgs:
                             if msg and msg.id:
                                 db_message_ids.append(msg.id)
-                                await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
-                                
+                                # 🔥 FIX: Save immortal file_id too so link is not tied to message IDs
+                                saved = await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
+                                if saved and msg.media:
+                                    mt = msg.media.value
+                                    if mt in ["document", "video", "audio", "photo", "animation"]:
+                                        media_obj = getattr(msg, mt)
+                                        immortal_files.append({"file_id": media_obj.file_id, "type": mt})
+                                        media_count += 1
                     except Exception as e_forward:
                         random_ids = [client.rnd_id() for _ in chunk]
                         result = await client.invoke(
@@ -508,58 +526,87 @@ async def handle_batch_messages(client, message):
                                 drop_author=True
                             )
                         )
-                        
                         raw_msg_ids = [u.message.id for u in result.updates if hasattr(u, "message") and hasattr(u.message, "id")]
                         if raw_msg_ids:
                             db_message_ids.extend(raw_msg_ids)
-                            # Fetch the raw messages so we can extract their file_ids
                             try:
-                                fetched_msgs = await client.get_messages(db_channel, raw_msg_ids)
-                                for msg in fetched_msgs:
-                                    await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
-                            except Exception: pass
+                                raw_fetched = await client.get_messages(db_channel, raw_msg_ids)
+                                for msg in raw_fetched:
+                                    saved = await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
+                                    if saved and msg and msg.media:
+                                        mt = msg.media.value
+                                        if mt in ["document", "video", "audio", "photo", "animation"]:
+                                            media_obj = getattr(msg, mt)
+                                            immortal_files.append({"file_id": media_obj.file_id, "type": mt})
+                                            media_count += 1
+                            except Exception:
+                                pass
 
                     processed_count += original_chunk_len
-                    prog_str = get_progress_string(processed_count, total_files, start_time)
-                    
-                    # Only update status every 5 chunks (500 files) to avoid edit limits on massive 50k batches
-                    if processed_count % 500 == 0 or processed_count == total_files:
+                    # 🔥 FIX: Progress bar is based on message-range position, capped at 100%
+                    display_count = min(processed_count, total_msgs)
+                    prog_str = get_progress_string(display_count, total_msgs, start_time)
+
+                    # Update status every 5 chunks (500 files) to avoid edit limits on massive batches
+                    if processed_count % 500 == 0 or processed_count >= total_msgs:
                         try:
-                            await status_msg.edit_text(f"🔄 **Batching in Progress...**\n\n{prog_str}", reply_markup=cancel_kb)
+                            await status_msg.edit_text(
+                                f"🔄 **Batching in Progress...**\n"
+                                f"🔁 Skipped: {skipped_count} duplicates\n\n{prog_str}",
+                                reply_markup=cancel_kb
+                            )
                         except Exception:
                             pass
 
                     await asyncio.sleep(2)
-                    break  # Chunk successful, break out of the while True retry loop
+                    break  # Success — exit while True retry loop
 
                 except FloodWait as e:
-                    # If we get rate limited, sleep and the while True loop will try this chunk again!
                     await asyncio.sleep(e.value + 1)
                 except Exception as e:
                     print(f"Batch chunk error: {e}")
-                    break  # For non-floodwait errors, skip the chunk to avoid infinite loops
+                    processed_count += original_chunk_len
+                    break  # Non-floodwait error — skip chunk to avoid infinite loop
             
-        del active_processes[process_id]
+        if process_id in active_processes:
+            del active_processes[process_id]
 
-        if len(db_message_ids) == 0:
-            return await status_msg.edit_text("❌ **Batch Cancelled.** No files were processed.")
+        if media_count == 0 and len(db_message_ids) == 0:
+            return await status_msg.edit_text(
+                f"❌ **Batch Complete — No new files saved.**\n"
+                f"🔁 All {skipped_count} files were already in the database."
+            )
 
         url_hash = generate_hash()
+        # 🔥 FIX: Store BOTH db_message_ids (fast channel delivery) AND immortal_files
+        # (survives DB channel message deletions/additions). Delivery will prefer immortal_files
+        # if db_message_ids become stale.
         await links_collection.insert_one({
             "hash": url_hash,
-            "db_message_ids": db_message_ids, # Standard message_ids for fast channel chunking
-            "db_channel_id": db_channel, # Store which DB channel holds these messages
+            "db_message_ids": db_message_ids,
+            "immortal_files": immortal_files,       # <- NEW: permanent fallback
+            "db_channel_id": db_channel,
             "creator_id": user_id
         })
 
         bot_username = (await client.get_me()).username
         shareable_link = f"https://t.me/{bot_username}?start={url_hash}"
-        final_str = get_progress_string(processed_count, total_files, start_time)
+        final_str = get_progress_string(min(processed_count, total_msgs), total_msgs, start_time)
         
+        summary = (
+            f"📦 **New files saved:** {media_count}\n"
+            f"🔁 **Duplicates skipped:** {skipped_count}\n\n"
+        )
         if is_cancelled:
-            await status_msg.edit_text(f"⚠️ **Batch Partially Saved!**\n\n{final_str}\n\n🔗 **Partial Link:**\n`{shareable_link}`")
+            await status_msg.edit_text(
+                f"⚠️ **Batch Partially Saved!**\n\n{summary}{final_str}\n\n"
+                f"🔗 **Partial Link:**\n`{shareable_link}`"
+            )
         else:
-            await status_msg.edit_text(f"✅ **Batch Successful!**\n\n{final_str}\n\n🔗 **Your permanent link:**\n`{shareable_link}`")
+            await status_msg.edit_text(
+                f"✅ **Batch Successful!**\n\n{summary}{final_str}\n\n"
+                f"🔗 **Your permanent link:**\n`{shareable_link}`"
+            )
 
     elif state_data["state"] == "waiting_for_channel_id":
         try:
@@ -635,8 +682,19 @@ async def deliver_content(client, message, url_hash, target_chat_id):
         total_files = len(files_list)
         source_db_channel = DB_CHANNEL_ID
     else:
-        is_immortal = "immortal_files" in link_data
-        files_list = link_data["immortal_files"] if is_immortal else link_data.get("db_message_ids", [])
+        # 🔥 FIX: Prefer immortal_files if available (survives DB channel edits/deletions).
+        # Fall back to db_message_ids only if immortal_files is absent or empty.
+        immortal_files_in_link = link_data.get("immortal_files", [])
+        db_msg_ids_in_link = link_data.get("db_message_ids", [])
+        if immortal_files_in_link:
+            is_immortal = True
+            files_list = immortal_files_in_link
+        elif db_msg_ids_in_link:
+            is_immortal = False
+            files_list = db_msg_ids_in_link
+        else:
+            files_list = []
+            is_immortal = False
         total_files = len(files_list)
         source_db_channel = link_data.get("db_channel_id", DB_CHANNEL_ID)
 
