@@ -168,18 +168,16 @@ async def get_channel_cmd(client, message):
         return await message.reply("Usage: `/getchannel <channel_id>`")
         
     status = await message.reply(f"⏳ **Searching for media from {channel_id}...**")
-    cursor = media_collection.find({"source_channel": channel_id})
-    all_media = await cursor.to_list(length=None)
+    count = await media_collection.count_documents({"source_channel": channel_id})
     
-    if not all_media:
+    if count == 0:
         return await status.edit_text("❌ **No media found for this channel.**")
         
     url_hash = generate_hash()
-    payload = [{"file_id": doc["_id"], "type": doc["type"]} for doc in all_media]
     
     await links_collection.insert_one({
         "hash": url_hash,
-        "immortal_files": payload,
+        "source_channel_query": channel_id,
         "creator_id": message.from_user.id
     })
 
@@ -188,15 +186,62 @@ async def get_channel_cmd(client, message):
 
     await status.edit_text(
         f"✅ **Channel Content Packaged!**\n\n"
-        f"📦 **Total Files:** {len(all_media)}\n"
+        f"📦 **Total Files:** {count}\n"
         f"🔗 **Your Link:**\n`{shareable_link}`"
     )
+
+@app.on_message(filters.command(["url", "urls"]) & filters.private)
+async def url_list_cmd(client, message):
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+    
+    status = await message.reply("⏳ **Generating channel links...**")
+    
+    pipeline = [
+        {"$group": {
+            "_id": "$source_channel",
+            "title": {"$first": "$source_title"},
+            "count": {"$sum": 1}
+        }}
+    ]
+    cursor = media_collection.aggregate(pipeline)
+    channels = await cursor.to_list(length=None)
+    
+    if not channels:
+        return await status.edit_text("❌ **No stored channels found.**")
+        
+    text = "📚 **Stored Channels:**\n\n"
+    bot_username = (await client.get_me()).username
+    
+    for ch in channels:
+        ch_id = ch["_id"]
+        title = ch.get("title") or ch_id
+        count = ch["count"]
+        
+        url_hash = generate_hash()
+        await links_collection.insert_one({
+            "hash": url_hash,
+            "source_channel_query": ch_id,
+            "creator_id": message.from_user.id
+        })
+        
+        shareable_link = f"https://t.me/{bot_username}?start={url_hash}"
+        text += f"**{title}** (`{ch_id}`) - {count} files\n🔗 `{shareable_link}`\n\n"
+        
+    if len(text) > 4000:
+        await status.delete()
+        for i in range(0, len(text), 4000):
+            await message.reply(text[i:i+4000])
+    else:
+        await status.edit_text(text)
 
 # ==========================================
 # 🚨 IMMORTAL MEDIA EXTRACTION ENGINE 🚨
 # ==========================================
-async def extract_and_save_media(msg, source_name="DB Channel"):
+async def extract_and_save_media(msg, source_name="DB Channel", source_title=None):
     """Extracts the immortal file_id from a message and saves it to MongoDB."""
+    if not source_title:
+        source_title = str(source_name)
+        
     if not msg or not msg.media: return False
     mt = msg.media.value
     if mt in ["document", "video", "audio", "photo", "animation"]:
@@ -212,6 +257,7 @@ async def extract_and_save_media(msg, source_name="DB Channel"):
                     "type": mt,
                     "file_name": fname,
                     "source_channel": str(source_name),
+                    "source_title": source_title,
                     "added_date": datetime.now().isoformat()
                 }},
                 upsert=True
@@ -324,6 +370,7 @@ async def handle_batch_messages(client, message):
         user_states[user_id] = {
             "state": "waiting_last_msg",
             "source_chat_id": message.forward_from_chat.id,
+            "source_chat_title": message.forward_from_chat.title if message.forward_from_chat else "Unknown",
             "first_msg_id": message.forward_from_message_id
         }
         await message.reply("First message saved. Now forward the **LAST** message.")
@@ -335,6 +382,7 @@ async def handle_batch_messages(client, message):
         first_msg_id = state_data["first_msg_id"]
         last_msg_id = message.forward_from_message_id
         source_chat_id = state_data["source_chat_id"]
+        source_chat_title = state_data.get("source_chat_title", "Unknown")
         
         del user_states[user_id]
         
@@ -384,7 +432,7 @@ async def handle_batch_messages(client, message):
                     for msg in forwarded_msgs:
                         if msg and msg.id:
                             db_message_ids.append(msg.id)
-                            await extract_and_save_media(msg, source_name=str(source_chat_id))
+                            await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
                             
                 except Exception as e_forward:
                     random_ids = [client.rnd_id() for _ in chunk]
@@ -405,7 +453,7 @@ async def handle_batch_messages(client, message):
                         try:
                             fetched_msgs = await client.get_messages(db_channel, raw_msg_ids)
                             for msg in fetched_msgs:
-                                await extract_and_save_media(msg, source_name=str(source_chat_id))
+                                await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
                         except Exception: pass
 
                 processed_count += len(chunk)
@@ -510,11 +558,19 @@ async def deliver_content(client, message, url_hash, target_chat_id):
     if not link_data:
         return await message.reply("❌ Error: Link data not found.")
         
-    # 🚨 LOGIC SPLIT: Determine if payload is fast message_ids or immortal file_ids
-    is_immortal = "immortal_files" in link_data
-    files_list = link_data["immortal_files"] if is_immortal else link_data.get("db_message_ids", [])
-    total_files = len(files_list)
-    source_db_channel = link_data.get("db_channel_id", DB_CHANNEL_ID)
+    if "source_channel_query" in link_data:
+        ch_id = link_data["source_channel_query"]
+        cursor = media_collection.find({"source_channel": ch_id})
+        all_media = await cursor.to_list(length=None)
+        files_list = [{"file_id": doc["_id"], "type": doc["type"]} for doc in all_media]
+        is_immortal = True
+        total_files = len(files_list)
+        source_db_channel = DB_CHANNEL_ID
+    else:
+        is_immortal = "immortal_files" in link_data
+        files_list = link_data["immortal_files"] if is_immortal else link_data.get("db_message_ids", [])
+        total_files = len(files_list)
+        source_db_channel = link_data.get("db_channel_id", DB_CHANNEL_ID)
 
     if total_files == 0:
         return await message.reply("❌ Error: No files found in this link.")
