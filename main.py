@@ -187,7 +187,8 @@ async def help_cmd(client, message):
         "• `/renamechannel <channel_id> <new_name>` - Give a custom name to a stored channel.\n"
         "• `/dbupload` - Package the entire MongoDB immortal DB.\n"
         "• `/adddb <channel_id>` - Add a new dynamic DB channel.\n"
-        "• `/deldb <channel_id>` - Remove a dynamic DB channel.\n\n"
+        "• `/deldb <channel_id>` - Remove a dynamic DB channel.\n"
+        "• `/dedupe` - Scan & remove duplicate files from database.\n\n"
         "**Owner Commands:**\n"
         "• `/addadmin <user_id>` - Add an admin.\n"
         "• `/deladmin <user_id>` - Remove an admin.\n"
@@ -272,8 +273,12 @@ async def url_list_cmd(client, message):
 # ==========================================
 # 🚨 IMMORTAL MEDIA EXTRACTION ENGINE 🚨
 # ==========================================
-async def extract_and_save_media(msg, source_name="DB Channel", source_title=None):
-    """Extracts the immortal file_id from a message and saves it to MongoDB."""
+async def extract_and_save_media(msg, source_name="DB Channel", source_title=None, overwrite_source=True):
+    """Extracts the immortal file_id from a message and saves it to MongoDB.
+    
+    Uses file_unique_id as _id so the same physical file is NEVER duplicated,
+    even if re-batched or re-forwarded (which generates new file_ids).
+    """
     if not source_title:
         source_title = str(source_name)
         
@@ -285,36 +290,59 @@ async def extract_and_save_media(msg, source_name="DB Channel", source_title=Non
         uid = media.file_unique_id
         fname = getattr(media, "file_name", f"{mt}_{uid}")
         try:
-            await media_collection.update_one(
-                {"_id": fid},
-                {"$set": {
-                    "file_unique_id": uid,
-                    "type": mt,
-                    "file_name": fname,
-                    "source_channel": str(source_name),
-                    "source_title": source_title,
-                    "added_date": datetime.now().isoformat()
-                }},
-                upsert=True
-            )
+            if overwrite_source:
+                # Full upsert: insert new or update all fields including source
+                await media_collection.update_one(
+                    {"_id": uid},                          # 🔥 FIX: file_unique_id as _id (content-stable)
+                    {"$set": {
+                        "file_id": fid,                    # 🔥 FIX: file_id stored as regular field
+                        "type": mt,
+                        "file_name": fname,
+                        "source_channel": str(source_name),
+                        "source_title": source_title,
+                        "added_date": datetime.now().isoformat()
+                    }},
+                    upsert=True
+                )
+            else:
+                # Only insert if new; never overwrite source info of existing records
+                await media_collection.update_one(
+                    {"_id": uid},
+                    {
+                        "$setOnInsert": {              # Only sets these fields on INSERT, not update
+                            "file_id": fid,
+                            "type": mt,
+                            "file_name": fname,
+                            "source_channel": str(source_name),
+                            "source_title": source_title,
+                            "added_date": datetime.now().isoformat()
+                        },
+                        "$set": {"file_id": fid}       # Always refresh file_id (Telegram may rotate it)
+                    },
+                    upsert=True
+                )
             return True
         except Exception as e:
-            print(f"[DB Error] Could not save media {fid}: {e}")
+            print(f"[DB Error] Could not save media {uid}: {e}")
     return False
 
 @app.on_message(filters.channel)
 async def auto_index_channel_media(client, message):
-    """Passively listens to the DB Channels and saves anything manually dropped there."""
+    """Passively listens to DB Channels and saves manually dropped files.
+    
+    Uses overwrite_source=False so batch operations that already indexed
+    a file with the correct source channel are NOT overwritten with 'Manual Drop'.
+    """
     if message.chat.id in DB_CHANNELS_CACHE or message.chat.id == DB_CHANNEL_ID:
-        await extract_and_save_media(message, source_name="Manual Drop")
+        await extract_and_save_media(message, source_name="Manual Drop", overwrite_source=False)
 
 # ==========================================
 # 🚨 DATABASE PACKAGING COMMANDS 🚨
 # ==========================================
 @app.on_message(filters.command("dbupload") & filters.private)
 async def db_upload_command(client, message):
-    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
     """Packages every single immortal file_id in the MongoDB into a single delivery link."""
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
     status = await message.reply("⏳ **Packaging all media from MongoDB...**")
     
     cursor = media_collection.find({})
@@ -326,12 +354,12 @@ async def db_upload_command(client, message):
     total_files = len(all_media)
     url_hash = generate_hash()
     
-    # 🚨 Convert the database documents into a lightweight delivery payload
-    payload = [{"file_id": doc["_id"], "type": doc["type"]} for doc in all_media]
+    # 🔥 FIX: doc["file_id"] not doc["_id"] — _id is now file_unique_id
+    payload = [{"file_id": doc["file_id"], "type": doc["type"]} for doc in all_media if doc.get("file_id")]
     
     await links_collection.insert_one({
         "hash": url_hash,
-        "immortal_files": payload, # Saves as immortal files instead of message_ids
+        "immortal_files": payload,
         "creator_id": message.from_user.id
     })
 
@@ -343,6 +371,65 @@ async def db_upload_command(client, message):
         f"📦 **Total Immortal Files:** {total_files}\n\n"
         f"🔗 **Your Master Link:**\n`{shareable_link}`\n\n"
         f"*(Tap the link to deliver all these files to your DM or Channel)*"
+    )
+
+@app.on_message(filters.command("dedupe") & filters.private)
+async def dedupe_cmd(client, message):
+    """Scans MongoDB for duplicate file_unique_ids and removes extras, keeping the best source info."""
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+    status = await message.reply("🔍 **Scanning for duplicates in database...**\n⏳ This may take a while for large collections.")
+
+    # Group by file_unique_id — after the fix, _id IS file_unique_id, so duplicates
+    # can only exist in OLD data where _id was file_id. We scan both fields.
+    pipeline = [
+        {"$group": {
+            "_id": "$file_unique_id",
+            "all_doc_ids": {"$push": "$_id"},
+            "sources": {"$push": "$source_channel"},
+            "file_ids": {"$push": "$file_id"},
+            "count": {"$sum": 1}
+        }},
+        {"$match": {"count": {"$gt": 1}}}
+    ]
+    cursor = media_collection.aggregate(pipeline)
+    dup_groups = await cursor.to_list(length=None)
+
+    if not dup_groups:
+        total = await media_collection.count_documents({})
+        return await status.edit_text(
+            f"✅ **No duplicates found!**\n"
+            f"📦 Database has **{total}** unique files — all clean."
+        )
+
+    total_dups = sum(g["count"] - 1 for g in dup_groups)
+    await status.edit_text(
+        f"🗑️ **Found {len(dup_groups)} duplicate groups** ({total_dups} extra entries)\n"
+        f"⏳ Removing extras, keeping best source info..."
+    )
+
+    removed = 0
+    LOW_PRIORITY_SOURCES = {"Manual Drop", "Batch Raw Fallback", "Direct PM", "DB Channel", "None", ""}
+
+    for group in dup_groups:
+        all_ids = group["all_doc_ids"]
+        sources = group["sources"]
+        # Pick the ID with the best (real channel) source to KEEP
+        best_idx = 0
+        for idx, src in enumerate(sources):
+            if str(src) not in LOW_PRIORITY_SOURCES:
+                best_idx = idx
+                break
+        keep_id = all_ids[best_idx]
+        delete_ids = [d for d in all_ids if d != keep_id]
+        await media_collection.delete_many({"_id": {"$in": delete_ids}})
+        removed += len(delete_ids)
+
+    total_after = await media_collection.count_documents({})
+    await status.edit_text(
+        f"✅ **Deduplication Complete!**\n\n"
+        f"🗑️ **Removed:** {removed} duplicate entries\n"
+        f"📦 **Remaining:** {total_after} unique files\n\n"
+        f"💡 Run `/url` to see your updated channel counts."
     )
 
 
@@ -677,7 +764,12 @@ async def deliver_content(client, message, url_hash, target_chat_id):
         ch_id = link_data["source_channel_query"]
         cursor = media_collection.find({"source_channel": ch_id})
         all_media = await cursor.to_list(length=None)
-        files_list = [{"file_id": doc["_id"], "type": doc["type"]} for doc in all_media]
+        # 🔥 FIX: _id is now file_unique_id; actual file_id is in doc["file_id"]
+        files_list = [
+            {"file_id": doc.get("file_id") or doc["_id"], "type": doc["type"]}
+            for doc in all_media
+            if doc.get("file_id") or doc.get("_id")
+        ]
         is_immortal = True
         total_files = len(files_list)
         source_db_channel = DB_CHANNEL_ID
