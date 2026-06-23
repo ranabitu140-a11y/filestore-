@@ -293,9 +293,10 @@ async def extract_and_save_media(msg, source_name="DB Channel", source_title=Non
             if overwrite_source:
                 # Full upsert: insert new or update all fields including source
                 await media_collection.update_one(
-                    {"_id": uid},                          # 🔥 FIX: file_unique_id as _id (content-stable)
+                    {"_id": uid},                          # 🔥 file_unique_id as _id (content-stable)
                     {"$set": {
-                        "file_id": fid,                    # 🔥 FIX: file_id stored as regular field
+                        "file_id": fid,                    # file_id stored as regular field
+                        "file_unique_id": uid,             # 🔥 FIX: also store as field for cross-format dup queries
                         "type": mt,
                         "file_name": fname,
                         "source_channel": str(source_name),
@@ -311,6 +312,7 @@ async def extract_and_save_media(msg, source_name="DB Channel", source_title=Non
                     {
                         "$setOnInsert": {              # Only sets these fields on INSERT, not update
                             "file_id": fid,
+                            "file_unique_id": uid,     # 🔥 FIX: store as field for cross-format dup queries
                             "type": mt,
                             "file_name": fname,
                             "source_channel": str(source_name),
@@ -543,7 +545,18 @@ async def handle_batch_messages(client, message):
                     if mt in ["document", "video", "audio", "photo", "animation"]:
                         media_obj = getattr(msg, mt)
                         if hasattr(media_obj, "file_unique_id"):
-                            exists = await media_collection.find_one({"file_unique_id": media_obj.file_unique_id})
+                            uid = media_obj.file_unique_id
+                            # 🔥 FIX: Query covers BOTH formats:
+                            # - Old records: _id=file_id, file_unique_id stored as a field
+                            # - New records: _id=file_unique_id, file_unique_id also stored as a field
+                            # Without $or, new-format records were invisible to this check
+                            # and the same file would be re-batched and re-inflated.
+                            exists = await media_collection.find_one({
+                                "$or": [
+                                    {"file_unique_id": uid},  # catches old AND new format records
+                                    {"_id": uid}              # catches new format if field was missing
+                                ]
+                            })
                             if exists:
                                 skipped_count += 1
                                 continue
