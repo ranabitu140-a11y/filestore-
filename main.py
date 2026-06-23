@@ -15,6 +15,7 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DB_CHANNEL_ID = int(os.environ.get("DB_CHANNEL_ID", "0"))
 MONGO_URI = os.environ.get("MONGO_URI", "")
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
 # --- Initialization ---
 app = Client("permanent_store_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -25,10 +26,23 @@ db = db_client.bot_database
 links_collection = db.stored_links
 active_deliveries = db.active_deliveries
 media_collection = db.media # 🚨 THE IMMORTAL FILE ID DATABASE
+admins_collection = db.admins
+db_channels_collection = db.db_channels
 
 # State and Process managers
 user_states = {}
 active_processes = {}
+
+ADMINS_CACHE = set()
+DB_CHANNELS_CACHE = set()
+
+def is_authorized(user_id):
+    return user_id == OWNER_ID or user_id in ADMINS_CACHE
+
+def get_db_channel():
+    if DB_CHANNELS_CACHE:
+        return random.choice(list(DB_CHANNELS_CACHE))
+    return DB_CHANNEL_ID
 
 # ==========================================
 # 🚨 PEER CACHE & ADMIN HELPERS 🚨
@@ -81,6 +95,104 @@ def get_progress_string(current, total, start_time):
     )
 
 # ==========================================
+# 🚨 ADMIN & CONFIG COMMANDS 🚨
+# ==========================================
+@app.on_message(filters.command("addadmin") & filters.private)
+async def add_admin_cmd(client, message):
+    if message.from_user.id != OWNER_ID: return await message.reply("⛔ Owner only.")
+    try:
+        user_id = int(message.command[1])
+        await admins_collection.update_one({"user_id": user_id}, {"$set": {"user_id": user_id}}, upsert=True)
+        ADMINS_CACHE.add(user_id)
+        await message.reply(f"✅ User {user_id} added as admin.")
+    except (IndexError, ValueError):
+        await message.reply("Usage: /addadmin <user_id>")
+
+@app.on_message(filters.command("deladmin") & filters.private)
+async def del_admin_cmd(client, message):
+    if message.from_user.id != OWNER_ID: return await message.reply("⛔ Owner only.")
+    try:
+        user_id = int(message.command[1])
+        await admins_collection.delete_one({"user_id": user_id})
+        ADMINS_CACHE.discard(user_id)
+        await message.reply(f"✅ User {user_id} removed from admins.")
+    except (IndexError, ValueError):
+        await message.reply("Usage: /deladmin <user_id>")
+
+@app.on_message(filters.command("adddb") & filters.private)
+async def add_db_cmd(client, message):
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+    try:
+        channel_id = int(message.command[1])
+        await db_channels_collection.update_one({"channel_id": channel_id}, {"$set": {"channel_id": channel_id}}, upsert=True)
+        DB_CHANNELS_CACHE.add(channel_id)
+        await message.reply(f"✅ Channel {channel_id} added to DB channels.")
+    except (IndexError, ValueError):
+        await message.reply("Usage: /adddb <channel_id>")
+
+@app.on_message(filters.command("deldb") & filters.private)
+async def del_db_cmd(client, message):
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+    try:
+        channel_id = int(message.command[1])
+        await db_channels_collection.delete_one({"channel_id": channel_id})
+        DB_CHANNELS_CACHE.discard(channel_id)
+        await message.reply(f"✅ Channel {channel_id} removed from DB channels.")
+    except (IndexError, ValueError):
+        await message.reply("Usage: /deldb <channel_id>")
+
+@app.on_message(filters.command("help") & filters.private)
+async def help_cmd(client, message):
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+    text = (
+        "🛠 **Bot Commands:**\n\n"
+        "**User/Admin Commands:**\n"
+        "• `/batch` - Clone a channel's media.\n"
+        "• `/getchannel <channel_id>` - Get a link for all stored media from a specific channel.\n"
+        "• `/dbupload` - Package the entire MongoDB immortal DB.\n"
+        "• `/dbclear` - Clear the entire MongoDB immortal DB.\n"
+        "• `/adddb <channel_id>` - Add a new dynamic DB channel.\n"
+        "• `/deldb <channel_id>` - Remove a dynamic DB channel.\n\n"
+        "**Owner Commands:**\n"
+        "• `/addadmin <user_id>` - Add an admin.\n"
+        "• `/deladmin <user_id>` - Remove an admin.\n"
+    )
+    await message.reply(text)
+
+@app.on_message(filters.command("getchannel") & filters.private)
+async def get_channel_cmd(client, message):
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+    try:
+        channel_id = message.command[1]
+    except IndexError:
+        return await message.reply("Usage: `/getchannel <channel_id>`")
+        
+    status = await message.reply(f"⏳ **Searching for media from {channel_id}...**")
+    cursor = media_collection.find({"source_channel": channel_id})
+    all_media = await cursor.to_list(length=None)
+    
+    if not all_media:
+        return await status.edit_text("❌ **No media found for this channel.**")
+        
+    url_hash = generate_hash()
+    payload = [{"file_id": doc["_id"], "type": doc["type"]} for doc in all_media]
+    
+    await links_collection.insert_one({
+        "hash": url_hash,
+        "immortal_files": payload,
+        "creator_id": message.from_user.id
+    })
+
+    bot_username = (await client.get_me()).username
+    shareable_link = f"https://t.me/{bot_username}?start={url_hash}"
+
+    await status.edit_text(
+        f"✅ **Channel Content Packaged!**\n\n"
+        f"📦 **Total Files:** {len(all_media)}\n"
+        f"🔗 **Your Link:**\n`{shareable_link}`"
+    )
+
+# ==========================================
 # 🚨 IMMORTAL MEDIA EXTRACTION ENGINE 🚨
 # ==========================================
 async def extract_and_save_media(msg, source_name="DB Channel"):
@@ -109,16 +221,18 @@ async def extract_and_save_media(msg, source_name="DB Channel"):
             print(f"[DB Error] Could not save media {fid}: {e}")
     return False
 
-@app.on_message(filters.chat(DB_CHANNEL_ID))
+@app.on_message(filters.channel)
 async def auto_index_channel_media(client, message):
-    """Passively listens to the DB Channel and saves anything manually dropped there."""
-    await extract_and_save_media(message, source_name="Manual Drop")
+    """Passively listens to the DB Channels and saves anything manually dropped there."""
+    if message.chat.id in DB_CHANNELS_CACHE or message.chat.id == DB_CHANNEL_ID:
+        await extract_and_save_media(message, source_name="Manual Drop")
 
 # ==========================================
 # 🚨 DATABASE PACKAGING COMMANDS 🚨
 # ==========================================
 @app.on_message(filters.command("dbupload") & filters.private)
 async def db_upload_command(client, message):
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
     """Packages every single immortal file_id in the MongoDB into a single delivery link."""
     status = await message.reply("⏳ **Packaging all media from MongoDB...**")
     
@@ -152,6 +266,7 @@ async def db_upload_command(client, message):
 
 @app.on_message(filters.command("dbclear") & filters.private)
 async def db_clear_command(client, message):
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
     """Empties the media MongoDB list for a fresh start."""
     deleted_count = (await media_collection.delete_many({})).deleted_count
     await message.reply(f"🗑️ **Database Cleared!**\nDeleted {deleted_count} files. New batches will start fresh.")
@@ -162,12 +277,14 @@ async def db_clear_command(client, message):
 
 @app.on_message(filters.command("batch") & filters.private)
 async def start_batch(client, message):
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
     user_states[message.from_user.id] = {"state": "waiting_first_msg"}
     await message.reply("Send or forward the **FIRST** message from your channel.")
 
-@app.on_message(filters.private & ~filters.command("start") & ~filters.command("batch") & ~filters.command("dbupload") & ~filters.command("dbclear"))
+@app.on_message(filters.private & ~filters.command("start") & ~filters.command("batch") & ~filters.command("dbupload") & ~filters.command("dbclear") & ~filters.command("help") & ~filters.command("addadmin") & ~filters.command("deladmin") & ~filters.command("adddb") & ~filters.command("deldb") & ~filters.command("getchannel"))
 async def handle_batch_messages(client, message):
     user_id = message.from_user.id
+    if not is_authorized(user_id): return
     state_data = user_states.get(user_id)
 
     # --- PM SINGLE UPLOAD INTERCEPTOR ---
@@ -175,7 +292,9 @@ async def handle_batch_messages(client, message):
         if message.media and message.media.value in ["document", "video", "audio", "photo", "animation"]:
             status = await message.reply("⏳ Extracting Immortal ID...")
             try:
-                copied_msg = await message.copy(DB_CHANNEL_ID)
+                db_channel = get_db_channel()
+                if db_channel == 0: return await status.edit_text("❌ No DB Channel Configured.")
+                copied_msg = await message.copy(db_channel)
                 await extract_and_save_media(copied_msg, source_name="Direct PM")
                 
                 media = getattr(message, message.media.value)
@@ -242,15 +361,20 @@ async def handle_batch_messages(client, message):
             chunk = message_ids_to_process[i:i + chunk_size]
 
             try:
+                db_channel = get_db_channel()
+                if db_channel == 0:
+                    await status_msg.edit_text("❌ No DB Channel Configured.")
+                    break
+
                 ok1 = await ensure_peer_loaded(client, source_chat_id)
-                ok2 = await ensure_peer_loaded(client, DB_CHANNEL_ID)
+                ok2 = await ensure_peer_loaded(client, db_channel)
                 if not ok1 or not ok2:
                     await status_msg.edit_text("❌ Unable to load channel peers.")
                     break
 
                 try:
                     forwarded_msgs = await client.forward_messages(
-                        chat_id=DB_CHANNEL_ID,
+                        chat_id=db_channel,
                         from_chat_id=source_chat_id,
                         message_ids=chunk,
                         disable_notification=True,
@@ -260,7 +384,7 @@ async def handle_batch_messages(client, message):
                     for msg in forwarded_msgs:
                         if msg and msg.id:
                             db_message_ids.append(msg.id)
-                            await extract_and_save_media(msg, source_name=f"Batch {url_hash if 'url_hash' in locals() else 'Upload'}")
+                            await extract_and_save_media(msg, source_name=str(source_chat_id))
                             
                 except Exception as e_forward:
                     random_ids = [client.rnd_id() for _ in chunk]
@@ -268,7 +392,7 @@ async def handle_batch_messages(client, message):
                         raw.functions.messages.ForwardMessages(
                             from_peer=await client.resolve_peer(source_chat_id),
                             id=chunk,
-                            to_peer=await client.resolve_peer(DB_CHANNEL_ID),
+                            to_peer=await client.resolve_peer(db_channel),
                             random_id=random_ids,
                             drop_author=True
                         )
@@ -279,9 +403,9 @@ async def handle_batch_messages(client, message):
                         db_message_ids.extend(raw_msg_ids)
                         # Fetch the raw messages so we can extract their file_ids
                         try:
-                            fetched_msgs = await client.get_messages(DB_CHANNEL_ID, raw_msg_ids)
+                            fetched_msgs = await client.get_messages(db_channel, raw_msg_ids)
                             for msg in fetched_msgs:
-                                await extract_and_save_media(msg, source_name="Batch Raw Fallback")
+                                await extract_and_save_media(msg, source_name=str(source_chat_id))
                         except Exception: pass
 
                 processed_count += len(chunk)
@@ -308,6 +432,7 @@ async def handle_batch_messages(client, message):
         await links_collection.insert_one({
             "hash": url_hash,
             "db_message_ids": db_message_ids, # Standard message_ids for fast channel chunking
+            "db_channel_id": db_channel, # Store which DB channel holds these messages
             "creator_id": user_id
         })
 
@@ -389,6 +514,7 @@ async def deliver_content(client, message, url_hash, target_chat_id):
     is_immortal = "immortal_files" in link_data
     files_list = link_data["immortal_files"] if is_immortal else link_data.get("db_message_ids", [])
     total_files = len(files_list)
+    source_db_channel = link_data.get("db_channel_id", DB_CHANNEL_ID)
 
     if total_files == 0:
         return await message.reply("❌ Error: No files found in this link.")
@@ -424,14 +550,14 @@ async def deliver_content(client, message, url_hash, target_chat_id):
 
             chunk = remaining_files[i:i + chunk_size]
 
-            if not await ensure_peer_loaded(client, DB_CHANNEL_ID) or not await ensure_peer_loaded(client, target_chat_id):
+            if not await ensure_peer_loaded(client, source_db_channel) or not await ensure_peer_loaded(client, target_chat_id):
                 await status_msg.edit_text(f"❌ Unable to load destination peer {target_chat_id}.")
                 break
 
             try:
                 await client.forward_messages(
                     chat_id=target_chat_id,
-                    from_chat_id=DB_CHANNEL_ID,
+                    from_chat_id=source_db_channel,
                     message_ids=chunk,
                     disable_notification=True,
                     drop_author=True
@@ -457,7 +583,7 @@ async def deliver_content(client, message, url_hash, target_chat_id):
                 try:
                     await asyncio.sleep(1)
                     await ensure_peer_loaded(client, target_chat_id, retries=2, delay=1)
-                    await client.forward_messages(chat_id=target_chat_id, from_chat_id=DB_CHANNEL_ID, message_ids=chunk, drop_author=True)
+                    await client.forward_messages(chat_id=target_chat_id, from_chat_id=source_db_channel, message_ids=chunk, drop_author=True)
                     success_count += len(chunk)
                 except Exception: continue
 
@@ -484,8 +610,8 @@ async def deliver_content(client, message, url_hash, target_chat_id):
                     await send_fn(target_chat_id, file_id)
                 # If Standard Batch, use copy_message
                 else:
-                    await client.resolve_peer(DB_CHANNEL_ID)
-                    await client.copy_message(target_chat_id, DB_CHANNEL_ID, item)
+                    await client.resolve_peer(source_db_channel)
+                    await client.copy_message(target_chat_id, source_db_channel, item)
                     
                 success_count += 1
                 
@@ -524,9 +650,21 @@ async def deliver_content(client, message, url_hash, target_chat_id):
 # ==========================================
 async def warmup_peers():
     try:
+        print("Loading DB Channels and Admins from MongoDB...")
+        async for admin in admins_collection.find({}):
+            ADMINS_CACHE.add(admin["user_id"])
+        async for db_chan in db_channels_collection.find({}):
+            DB_CHANNELS_CACHE.add(db_chan["channel_id"])
+            
         print("Loading peer cache...")
-        await app.get_chat(DB_CHANNEL_ID)
-        
+        if DB_CHANNEL_ID != 0:
+            try: await app.get_chat(DB_CHANNEL_ID)
+            except Exception: pass
+            
+        for db_chan in DB_CHANNELS_CACHE:
+            try: await app.get_chat(db_chan)
+            except Exception: pass
+            
         async for dialog in app.get_dialogs():
             pass
             

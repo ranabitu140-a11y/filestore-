@@ -24,8 +24,9 @@ A powerful Telegram bot that stores files **permanently** using MongoDB and Tele
 | `API_ID`        | ✅ Yes    | Your Telegram App's API ID — get it from [my.telegram.org](https://my.telegram.org) |
 | `API_HASH`      | ✅ Yes    | Your Telegram App's API Hash — get it from [my.telegram.org](https://my.telegram.org) |
 | `BOT_TOKEN`     | ✅ Yes    | Your bot token from [@BotFather](https://t.me/BotFather)                   |
-| `DB_CHANNEL_ID` | ✅ Yes    | The numeric ID of your private Telegram channel used as file storage (e.g., `-1001234567890`) |
-| `MONGO_URI`     | ✅ Yes    | MongoDB connection string (e.g., `mongodb+srv://user:pass@cluster.mongodb.net/`) |
+| `DB_CHANNEL_ID` | ✅ Yes    | Default DB Channel ID. Falls back to dynamic DB channels if set. |
+| `MONGO_URI`     | ✅ Yes    | MongoDB connection string (e.g., `mongodb+srv://...`) |
+| `OWNER_ID`      | ✅ Yes    | The numeric Telegram User ID of the bot owner. |
 
 > **Note:** If any variable is missing or wrong, the bot will silently fail to connect. All 5 variables are mandatory.
 
@@ -91,12 +92,23 @@ MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net/
 
 ## 📋 Bot Commands
 
-| Command      | Description                                                      |
-|--------------|------------------------------------------------------------------|
-| `/start`     | Welcome message. Appended with a hash it triggers file delivery. |
-| `/batch`     | Start a bulk clone — forward first + last message from a channel.|
-| `/dbupload`  | Package the entire MongoDB into one master shareable link.       |
-| `/dbclear`   | Clear all entries from the MongoDB media collection.             |
+### User / Admin Commands
+| Command | Description |
+|---|---|
+| `/start` | Delivery mechanism for hashed links. |
+| `/batch` | Clone a channel by forwarding the first and last message. |
+| `/dbupload` | Package the entire MongoDB into one master link. |
+| `/dbclear` | Clear the MongoDB media collection. |
+| `/getchannel <id>`| Generate a link for all media from a specific source channel. |
+| `/adddb <id>` | Dynamically add a channel to act as a database. |
+| `/deldb <id>` | Remove a dynamic database channel. |
+| `/help` | List all commands. |
+
+### Owner Commands
+| Command | Description |
+|---|---|
+| `/addadmin <id>` | Authorize a user to use admin commands. |
+| `/deladmin <id>` | Revoke a user's admin access. |
 
 ---
 
@@ -138,7 +150,7 @@ User ──/start?hash──► Bot ──find_one──►MongoDB
 
 ### 🔴 Critical
 
-1. **No Authorization Check** — Any Telegram user can run `/batch`, `/dbupload`, and `/dbclear`. There is no admin/owner whitelist, meaning anyone can wipe your database or clone channels.
+1. **~~No Authorization Check~~ (Fixed)** — A strict `OWNER_ID` and admin-whitelist system is now active. Only authorized users can execute bot commands.
 2. **Bare `except` blocks silently swallow errors** — Several `except Exception: pass` blocks hide real failures, making debugging very difficult and allowing corrupt states to persist.
 
 ### 🟠 High
@@ -164,7 +176,7 @@ User ──/start?hash──► Bot ──find_one──►MongoDB
 
 ## 🔒 Security Hardening Checklist
 
-- [ ] Add an `OWNER_ID` env variable and guard all admin commands with `if message.from_user.id != OWNER_ID: return`
+- [x] Add an `OWNER_ID` env variable and guard all admin commands with `is_authorized` check.
 - [ ] Pin all dependency versions in `requirements.txt`
 - [ ] Replace `except Exception: pass` with proper logging
 - [ ] Fix `split("_")` callback parsing to use `split("_", 1)` or `split("_", 2)`
