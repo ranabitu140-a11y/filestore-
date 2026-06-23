@@ -430,8 +430,10 @@ async def handle_batch_messages(client, message):
                 break
 
             chunk = message_ids_to_process[i:i + chunk_size]
+            original_chunk_len = len(chunk)
 
-            try:
+            while True:
+                try:
                 db_channel = get_db_channel()
                 if db_channel == 0:
                     await status_msg.edit_text("❌ No DB Channel Configured.")
@@ -510,20 +512,25 @@ async def handle_batch_messages(client, message):
                                 await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
                         except Exception: pass
 
-                processed_count += chunk_len
+                processed_count += original_chunk_len
                 prog_str = get_progress_string(processed_count, total_files, start_time)
                 
-                try:
-                    await status_msg.edit_text(f"🔄 **Batching in Progress...**\n\n{prog_str}", reply_markup=cancel_kb)
-                except Exception:
-                    pass
+                # Only update status every 5 chunks (500 files) to avoid edit limits on massive 50k batches
+                if processed_count % 500 == 0 or processed_count == total_files:
+                    try:
+                        await status_msg.edit_text(f"🔄 **Batching in Progress...**\n\n{prog_str}", reply_markup=cancel_kb)
+                    except Exception:
+                        pass
 
                 await asyncio.sleep(2)
+                break  # Chunk successful, break out of the while True retry loop
 
             except FloodWait as e:
-                await asyncio.sleep(e.value)
-            except Exception:
-                pass
+                # If we get rate limited, sleep and the while True loop will try this chunk again!
+                await asyncio.sleep(e.value + 1)
+            except Exception as e:
+                print(f"Batch chunk error: {e}")
+                break  # For non-floodwait errors, skip the chunk to avoid infinite loops
             
         del active_processes[process_id]
 
