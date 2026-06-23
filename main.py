@@ -174,7 +174,6 @@ async def help_cmd(client, message):
         "• `/getchannel <channel_id>` - Get a link for all stored media from a specific channel.\n"
         "• `/renamechannel <channel_id> <new_name>` - Give a custom name to a stored channel.\n"
         "• `/dbupload` - Package the entire MongoDB immortal DB.\n"
-        "• `/dbclear` - Clear the entire MongoDB immortal DB.\n"
         "• `/adddb <channel_id>` - Add a new dynamic DB channel.\n"
         "• `/deldb <channel_id>` - Remove a dynamic DB channel.\n\n"
         "**Owner Commands:**\n"
@@ -334,12 +333,7 @@ async def db_upload_command(client, message):
         f"*(Tap the link to deliver all these files to your DM or Channel)*"
     )
 
-@app.on_message(filters.command("dbclear") & filters.private)
-async def db_clear_command(client, message):
-    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
-    """Empties the media MongoDB list for a fresh start."""
-    deleted_count = (await media_collection.delete_many({})).deleted_count
-    await message.reply(f"🗑️ **Database Cleared!**\nDeleted {deleted_count} files. New batches will start fresh.")
+
 
 # ==========================================
 # 1. MANUAL BATCH & SINGLE UPLOAD WORKFLOW
@@ -351,7 +345,7 @@ async def start_batch(client, message):
     user_states[message.from_user.id] = {"state": "waiting_first_msg"}
     await message.reply("Send or forward the **FIRST** message from your channel.")
 
-@app.on_message(filters.private & ~filters.command(["start", "batch", "dbupload", "dbclear", "help", "addadmin", "deladmin", "adddb", "deldb", "getchannel", "url", "urls", "renamechannel"]))
+@app.on_message(filters.private & ~filters.command(["start", "batch", "dbupload", "help", "addadmin", "deladmin", "adddb", "deldb", "getchannel", "url", "urls", "renamechannel"]))
 async def handle_batch_messages(client, message):
     user_id = message.from_user.id
     if not is_authorized(user_id): return
@@ -444,6 +438,37 @@ async def handle_batch_messages(client, message):
                     await status_msg.edit_text("❌ Unable to load channel peers.")
                     break
 
+                chunk_len = len(chunk)
+
+                # --- DUPLICATE FILTERING ---
+                try:
+                    fetched_msgs = await client.get_messages(source_chat_id, chunk)
+                    valid_chunk = []
+                    for msg in fetched_msgs:
+                        if not msg or msg.empty or not msg.media:
+                            continue
+                        mt = msg.media.value
+                        if mt in ["document", "video", "audio", "photo", "animation"]:
+                            media = getattr(msg, mt)
+                            if hasattr(media, "file_unique_id"):
+                                exists = await media_collection.find_one({"file_unique_id": media.file_unique_id})
+                                if exists:
+                                    continue
+                        valid_chunk.append(msg.id)
+                        
+                    if not valid_chunk:
+                        processed_count += chunk_len
+                        prog_str = get_progress_string(processed_count, total_files, start_time)
+                        try:
+                            await status_msg.edit_text(f"🔄 **Skipped {chunk_len} duplicates...**\n\n{prog_str}", reply_markup=cancel_kb)
+                        except Exception: pass
+                        continue
+                    
+                    chunk = valid_chunk
+                except Exception as filter_err:
+                    print(f"Duplicate check error: {filter_err}")
+                # --- END DUPLICATE FILTERING ---
+
                 try:
                     forwarded_msgs = await client.forward_messages(
                         chat_id=db_channel,
@@ -480,7 +505,7 @@ async def handle_batch_messages(client, message):
                                 await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
                         except Exception: pass
 
-                processed_count += len(chunk)
+                processed_count += chunk_len
                 prog_str = get_progress_string(processed_count, total_files, start_time)
                 
                 try:
