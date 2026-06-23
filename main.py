@@ -141,6 +141,27 @@ async def del_db_cmd(client, message):
     except (IndexError, ValueError):
         await message.reply("Usage: /deldb <channel_id>")
 
+@app.on_message(filters.command("renamechannel") & filters.private)
+async def rename_channel_cmd(client, message):
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+    parts = message.text.split(" ", 2)
+    if len(parts) < 3:
+        return await message.reply("Usage: `/renamechannel <channel_id> <New Name>`\nExample: `/renamechannel -10012345 My Movies`")
+    
+    channel_id = parts[1]
+    new_title = parts[2]
+    
+    status = await message.reply("⏳ **Updating channel name...**")
+    result = await media_collection.update_many(
+        {"source_channel": channel_id},
+        {"$set": {"source_title": new_title}}
+    )
+    
+    if result.matched_count == 0:
+        await status.edit_text("❌ **No media found for this channel ID.**")
+    else:
+        await status.edit_text(f"✅ **Success!**\nUpdated the name to **{new_title}** for {result.modified_count} files.")
+
 @app.on_message(filters.command("help") & filters.private)
 async def help_cmd(client, message):
     if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
@@ -148,7 +169,9 @@ async def help_cmd(client, message):
         "🛠 **Bot Commands:**\n\n"
         "**User/Admin Commands:**\n"
         "• `/batch` - Clone a channel's media.\n"
+        "• `/url` - List all stored channels and get their permanent links.\n"
         "• `/getchannel <channel_id>` - Get a link for all stored media from a specific channel.\n"
+        "• `/renamechannel <channel_id> <new_name>` - Give a custom name to a stored channel.\n"
         "• `/dbupload` - Package the entire MongoDB immortal DB.\n"
         "• `/dbclear` - Clear the entire MongoDB immortal DB.\n"
         "• `/adddb <channel_id>` - Add a new dynamic DB channel.\n"
@@ -327,7 +350,7 @@ async def start_batch(client, message):
     user_states[message.from_user.id] = {"state": "waiting_first_msg"}
     await message.reply("Send or forward the **FIRST** message from your channel.")
 
-@app.on_message(filters.private & ~filters.command("start") & ~filters.command("batch") & ~filters.command("dbupload") & ~filters.command("dbclear") & ~filters.command("help") & ~filters.command("addadmin") & ~filters.command("deladmin") & ~filters.command("adddb") & ~filters.command("deldb") & ~filters.command("getchannel"))
+@app.on_message(filters.private & ~filters.command(["start", "batch", "dbupload", "dbclear", "help", "addadmin", "deladmin", "adddb", "deldb", "getchannel", "url", "urls", "renamechannel"]))
 async def handle_batch_messages(client, message):
     user_id = message.from_user.id
     if not is_authorized(user_id): return

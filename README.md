@@ -100,6 +100,8 @@ MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net/
 | `/dbupload` | Package the entire MongoDB into one master link. |
 | `/dbclear` | Clear the MongoDB media collection. |
 | `/getchannel <id>`| Generate a link for all media from a specific source channel. |
+| `/url` | List all stored channels by name and ID with permanent links. |
+| `/renamechannel <id> <name>` | Assign a custom name to a channel in MongoDB. |
 | `/adddb <id>` | Dynamically add a channel to act as a database. |
 | `/deldb <id>` | Remove a dynamic database channel. |
 | `/help` | List all commands. |
