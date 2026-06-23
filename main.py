@@ -8,6 +8,7 @@ from pyrogram import Client, filters, raw, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram.errors import FloodWait
+from keep_alive import keep_alive
 
 # --- Configuration & Credentials ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -759,7 +760,10 @@ async def resume_interrupted_deliveries():
 
 if __name__ == "__main__":
     print("Bot starting...")
-    
+
+    # 🌐 Start the Flask live-status server first so the host sees an open port
+    keep_alive()
+
     app.start()
     
     app.loop.run_until_complete(warmup_peers())
