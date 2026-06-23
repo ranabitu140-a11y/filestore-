@@ -179,21 +179,34 @@ async def rename_channel_cmd(client, message):
 async def help_cmd(client, message):
     if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
     text = (
-        "🛠 **Bot Commands:**\n\n"
-        "**User/Admin Commands:**\n"
-        "• `/batch` - Clone a channel's media.\n"
-        "• `/url` - List all stored channels and get their permanent links.\n"
-        "• `/getchannel <channel_id>` - Get a link for all stored media from a specific channel.\n"
-        "• `/renamechannel <channel_id> <new_name>` - Give a custom name to a stored channel.\n"
-        "• `/dbupload` - Package the entire MongoDB immortal DB.\n"
-        "• `/adddb <channel_id>` - Add a new dynamic DB channel.\n"
-        "• `/deldb <channel_id>` - Remove a dynamic DB channel.\n"
-        "• `/dedupe` - Scan & remove duplicate files from database.\n"
-        "• `/reassign <old_source> | <channel_id> [title]` - Move orphaned files to a real channel.\n"
-        "• `/makeimmortal` - Convert ALL existing links & label orphaned files as 'Free Files'.\n\n"
-        "**Owner Commands:**\n"
-        "• `/addadmin <user_id>` - Add an admin.\n"
-        "• `/deladmin <user_id>` - Remove an admin.\n"
+        "🛠 **Bot Commands**\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "📦 **Batch & Storage**\n"
+        "• `/batch` — Clone a channel's media into the DB.\n"
+        "• `/url` — List all stored channels with permanent links.\n"
+        "• `/getchannel <channel_id>` — Package a specific channel into a link.\n"
+        "• `/dbupload` — Package the **entire** MongoDB into one master link.\n\n"
+
+        "🏷️ **Channel Management**\n"
+        "• `/renamechannel <channel_id> <name>` — Set a display name for a stored channel.\n"
+        "• `/reassign <old_source> | <channel_id> [title]` — Move orphaned files to a real channel.\n\n"
+
+        "🧹 **Database Maintenance**\n"
+        "• `/dedupe` — Remove duplicate files from database.\n"
+        "• `/makeimmortal` — Convert ALL old links to immortal format & label orphaned files as **Free Files**.\n\n"
+
+        "⚙️ **DB Channel Config**\n"
+        "• `/adddb <channel_id>` — Add a dynamic DB storage channel.\n"
+        "• `/deldb <channel_id>` — Remove a DB storage channel.\n\n"
+
+        "👑 **Owner Only**\n"
+        "• `/addadmin <user_id>` — Add an admin.\n"
+        "• `/deladmin <user_id>` — Remove an admin.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 **Tip:** Run `/makeimmortal` once to make all your existing data\n"
+        "survive DB channel or source channel deletion permanently."
     )
     await message.reply(text)
 
@@ -647,7 +660,13 @@ async def start_batch(client, message):
     user_states[message.from_user.id] = {"state": "waiting_first_msg"}
     await message.reply("Send or forward the **FIRST** message from your channel.")
 
-@app.on_message(filters.private & ~filters.command(["start", "batch", "dbupload", "help", "addadmin", "deladmin", "adddb", "deldb", "getchannel", "url", "urls", "renamechannel"]))
+@app.on_message(filters.private & ~filters.command([
+    "start", "batch", "dbupload", "help",
+    "addadmin", "deladmin",
+    "adddb", "deldb",
+    "getchannel", "url", "urls",
+    "renamechannel", "dedupe", "reassign", "makeimmortal"
+]))
 async def handle_batch_messages(client, message):
     user_id = message.from_user.id
     if not is_authorized(user_id): return
