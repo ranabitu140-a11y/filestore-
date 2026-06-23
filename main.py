@@ -188,7 +188,8 @@ async def help_cmd(client, message):
         "• `/dbupload` - Package the entire MongoDB immortal DB.\n"
         "• `/adddb <channel_id>` - Add a new dynamic DB channel.\n"
         "• `/deldb <channel_id>` - Remove a dynamic DB channel.\n"
-        "• `/dedupe` - Scan & remove duplicate files from database.\n\n"
+        "• `/dedupe` - Scan & remove duplicate files from database.\n"
+        "• `/reassign <old_source> | <channel_id> [title]` - Move orphaned files to a real channel.\n\n"
         "**Owner Commands:**\n"
         "• `/addadmin <user_id>` - Add an admin.\n"
         "• `/deladmin <user_id>` - Remove an admin.\n"
@@ -448,6 +449,67 @@ async def dedupe_cmd(client, message):
         f"🗑️ **Removed:** {removed} duplicate entries\n"
         f"📦 **Remaining:** {total_after} unique files\n\n"
         f"💡 Run `/url` to see your updated channel counts."
+    )
+
+@app.on_message(filters.command("reassign") & filters.private)
+async def reassign_cmd(client, message):
+    """Moves orphaned files (e.g. 'Uncategorized' or 'Batch Raw Fallback') to a real channel ID.
+    Usage: /reassign <old_source> | <channel_id> [optional title]
+    """
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+    
+    raw_text = message.text.split(None, 1)
+    if len(raw_text) < 2 or "|" not in raw_text[1]:
+        return await message.reply(
+            "❌ **Usage:** `/reassign <old_source> | <channel_id> [title]`\n\n"
+            "**Examples:**\n"
+            "`/reassign Uncategorized | -1003868096217 Vip Channel`\n"
+            "`/reassign Batch Raw Fallback | -1003868096217`\n\n"
+            "💡 Find old source names from `/url` output."
+        )
+    
+    parts = raw_text[1].split("|", 1)
+    old_source = parts[0].strip()
+    right_parts = parts[1].strip().split(None, 1)
+    
+    if not right_parts:
+        return await message.reply("❌ Missing channel_id after `|`")
+    
+    new_channel_id = right_parts[0].strip()
+    new_title = right_parts[1].strip() if len(right_parts) > 1 else new_channel_id
+    
+    try:
+        int(new_channel_id)
+    except ValueError:
+        return await message.reply(f"❌ `{new_channel_id}` is not a valid channel ID. Must be numeric like `-1003868096217`.")
+    
+    status = await message.reply(
+        f"⏳ **Reassigning files...**\n"
+        f"From: `{old_source}`\n"
+        f"To: `{new_channel_id}` ({new_title})"
+    )
+    
+    count = await media_collection.count_documents({"source_channel": old_source})
+    if count == 0:
+        return await status.edit_text(
+            f"❌ **No files found** with source `{old_source}`.\n"
+            f"Check `/url` for exact source names."
+        )
+    
+    result = await media_collection.update_many(
+        {"source_channel": old_source},
+        {"$set": {
+            "source_channel": new_channel_id,
+            "source_title": new_title
+        }}
+    )
+    
+    await status.edit_text(
+        f"✅ **Reassignment Complete!**\n\n"
+        f"📂 **Old source:** `{old_source}`\n"
+        f"📡 **New channel:** `{new_channel_id}` ({new_title})\n"
+        f"📦 **Files moved:** {result.modified_count}\n\n"
+        f"💡 Run `/url` to see the updated channel in your list."
     )
 
 
