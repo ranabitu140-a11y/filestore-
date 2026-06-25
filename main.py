@@ -803,11 +803,16 @@ async def handle_batch_messages(client, message):
         total_msgs = len(message_ids_to_process)   # total message ID range (includes non-media)
         media_count = 0                             # only actual media processed
         skipped_count = 0                           # duplicates skipped
-        chunk_size = 25  # Reduced to 25 to prevent Telegram 500 WORKER_BUSY_TOO_LONG_RETRY errors
+        chunk_size = 60  # Increased for faster batching
         
         start_time = time.time()
         processed_count = 0   # tracks position in message_ids_to_process for ETA display
         is_cancelled = False
+        
+        db_channel = get_db_channel()
+        if db_channel != 0:
+            await ensure_peer_loaded(client, source_chat_id)
+            await ensure_peer_loaded(client, db_channel)
 
         for i in range(0, total_msgs, chunk_size):
             if active_processes.get(process_id):
@@ -875,18 +880,10 @@ async def handle_batch_messages(client, message):
                 try:
                     db_channel = get_db_channel()
                     if db_channel == 0:
-                        await status_msg.edit_text("❌ No DB Channel Configured.")
-                        break
-
-                    ok1 = await ensure_peer_loaded(client, source_chat_id)
-                    ok2 = await ensure_peer_loaded(client, db_channel)
-                    if not ok1 or not ok2:
                         try:
-                            await status_msg.edit_text("❌ Unable to load channel peers. Retrying...")
-                        except Exception:
-                            pass
-                        await asyncio.sleep(2)
-                        continue # Try again instead of breaking!
+                            await status_msg.edit_text("❌ No DB Channel Configured.")
+                        except: pass
+                        break
 
                     print(f"[Batch] Forwarding {len(chunk)} messages via raw API...")
                     random_ids = [client.rnd_id() for _ in chunk]
@@ -908,6 +905,7 @@ async def handle_batch_messages(client, message):
                                 raw_msg_ids.append(u.message.id)
                             elif hasattr(u, "id"):
                                 raw_msg_ids.append(u.id)
+                    raw_msg_ids = list(set(raw_msg_ids)) # 🔥 Optimize: Telegram sends duplicate IDs (UpdateMessageID + UpdateNewChannelMessage), dedup them!
                                 
                     print(f"[Batch] Extracted {len(raw_msg_ids)} new message IDs from DB channel.")
                     if raw_msg_ids:
@@ -955,7 +953,7 @@ async def handle_batch_messages(client, message):
                                         saved_in_chunk += 1
                                         
                         print(f"[Batch] Successfully saved {saved_in_chunk} media files to MongoDB.")
-                        await asyncio.sleep(3) # Give Telegram servers a breather
+                        await asyncio.sleep(1) # Give Telegram servers a brief breather
 
                     processed_count += original_chunk_len
                     # 🔥 FIX: Progress bar is based on message-range position, capped at 100%
