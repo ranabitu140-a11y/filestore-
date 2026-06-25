@@ -852,6 +852,7 @@ async def handle_batch_messages(client, message):
                     # Entire chunk is duplicates — advance and skip
                     all_duplicates = True
                     processed_count += original_chunk_len
+                    print(f"[Batch] Chunk {processed_count}/{total_msgs}: 0 valid media (all duplicates/empty)")
                     prog_str = get_progress_string(processed_count, total_msgs, start_time)
                     try:
                         await status_msg.edit_text(
@@ -862,6 +863,7 @@ async def handle_batch_messages(client, message):
                         pass
                 else:
                     chunk = valid_ids  # Only forward the non-duplicate IDs
+                    print(f"[Batch] Chunk {processed_count + original_chunk_len}/{total_msgs}: Found {len(chunk)} valid media to forward.")
             except Exception as filter_err:
                 print(f"Duplicate check error: {filter_err}")
             # --- END DUPLICATE FILTERING ---
@@ -882,6 +884,7 @@ async def handle_batch_messages(client, message):
                         await status_msg.edit_text("❌ Unable to load channel peers.")
                         break
 
+                    print(f"[Batch] Forwarding {len(chunk)} messages via raw API...")
                     random_ids = [client.rnd_id() for _ in chunk]
                     result = await client.invoke(
                         raw.functions.messages.ForwardMessages(
@@ -892,6 +895,7 @@ async def handle_batch_messages(client, message):
                             drop_author=True
                         )
                     )
+                    print(f"[Batch] Forward API returned successfully.")
                     
                     raw_msg_ids = []
                     if hasattr(result, "updates"):
@@ -901,6 +905,7 @@ async def handle_batch_messages(client, message):
                             elif hasattr(u, "id"):
                                 raw_msg_ids.append(u.id)
                                 
+                    print(f"[Batch] Extracted {len(raw_msg_ids)} new message IDs from DB channel.")
                     if raw_msg_ids:
                         db_message_ids.extend(raw_msg_ids)
                         
@@ -909,6 +914,7 @@ async def handle_batch_messages(client, message):
                         raw_fetched = []
                         while retries > 0:
                             try:
+                                print(f"[Batch] Fetching {len(raw_msg_ids)} messages from DB channel to save to DB...")
                                 raw_fetched = await client.get_messages(db_channel, raw_msg_ids)
                                 break
                             except FloodWait as fw:
@@ -919,6 +925,7 @@ async def handle_batch_messages(client, message):
                                 print(f"Error fetching forwarded messages: {e_fetch}")
                                 break
 
+                        saved_in_chunk = 0
                         for msg in raw_fetched:
                             if not msg or msg.empty: continue
                             try:
@@ -941,14 +948,17 @@ async def handle_batch_messages(client, message):
                                     if hasattr(media_obj, "file_id"):
                                         immortal_files.append({"file_id": media_obj.file_id, "type": mt})
                                         media_count += 1
+                                        saved_in_chunk += 1
+                                        
+                        print(f"[Batch] Successfully saved {saved_in_chunk} media files to MongoDB.")
 
                     processed_count += original_chunk_len
                     # 🔥 FIX: Progress bar is based on message-range position, capped at 100%
                     display_count = min(processed_count, total_msgs)
                     prog_str = get_progress_string(display_count, total_msgs, start_time)
 
-                    # Update status every 5 chunks (500 files) to avoid edit limits on massive batches
-                    if processed_count % 500 == 0 or processed_count >= total_msgs:
+                    # Update status every 1 chunk (100 messages checked) to avoid edit limits but keep user informed
+                    if processed_count % 100 == 0 or processed_count >= total_msgs:
                         try:
                             await status_msg.edit_text(
                                 f"🔄 **Batching in Progress...**\n"
