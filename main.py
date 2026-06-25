@@ -377,7 +377,6 @@ async def extract_and_save_media(msg, source_name="DB Channel", source_title=Non
                     {"_id": uid},
                     {
                         "$setOnInsert": {              # Only sets these fields on INSERT, not update
-                            "file_id": fid,
                             "file_unique_id": uid,     # 🔥 FIX: store as field for cross-format dup queries
                             "type": mt,
                             "file_name": fname,
