@@ -210,6 +210,49 @@ async def help_cmd(client, message):
     )
     await message.reply(text)
 
+@app.on_message(filters.command("dbstats") & filters.private)
+async def dbstats_cmd(client, message):
+    """Shows live collection counts — use this to diagnose why batch skips everything."""
+    if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+    status = await message.reply("⏳ Checking database...")
+
+    media_count   = await media_collection.count_documents({})
+    links_count   = await links_collection.count_documents({})
+    admins_count  = await admins_collection.count_documents({})
+    dbch_count    = await db_channels_collection.count_documents({})
+
+    # Show a sample media record so the user can see what's actually stored
+    sample = await media_collection.find_one({})
+    sample_text = ""
+    if sample:
+        sample_text = (
+            f"\n\n**🔍 Sample media record:**\n"
+            f"• `_id` = `{sample.get('_id', 'N/A')}`\n"
+            f"• type = `{sample.get('type', 'N/A')}`\n"
+            f"• source = `{sample.get('source_channel', 'N/A')}`\n"
+            f"• title = `{sample.get('source_title', 'N/A')}`"
+        )
+    else:
+        sample_text = "\n\n✅ **media collection is EMPTY** — batch should save new files normally."
+
+    # Ping to confirm connection
+    ok, err = await test_mongo_connection()
+    conn_status = "✅ Connected" if ok else f"❌ FAILED: `{err}`"
+
+    await status.edit_text(
+        f"📊 **MongoDB Stats**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔌 Connection: {conn_status}\n\n"
+        f"📁 `media` collection: **{media_count}** records\n"
+        f"🔗 `stored_links`: **{links_count}** records\n"
+        f"👤 `admins`: **{admins_count}** records\n"
+        f"📡 `db_channels`: **{dbch_count}** records"
+        f"{sample_text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 If `media` has records → batch sees them as **duplicates** and skips.\n"
+        f"Run `/dedupe` or manually drop the `media` collection in Atlas."
+    )
+
 @app.on_message(filters.command("getchannel") & filters.private)
 async def get_channel_cmd(client, message):
     if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
@@ -288,6 +331,14 @@ async def url_list_cmd(client, message):
 # ==========================================
 # 🚨 IMMORTAL MEDIA EXTRACTION ENGINE 🚨
 # ==========================================
+async def test_mongo_connection():
+    """Pings MongoDB to confirm the connection is alive. Returns (ok, error_msg)."""
+    try:
+        await db_client.admin.command("ping")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
 async def extract_and_save_media(msg, source_name="DB Channel", source_title=None, overwrite_source=True):
     """Extracts the immortal file_id from a message and saves it to MongoDB.
     
@@ -340,7 +391,9 @@ async def extract_and_save_media(msg, source_name="DB Channel", source_title=Non
                 )
             return True
         except Exception as e:
+            # 🔥 Re-raise so caller (batch loop) knows MongoDB is down — not silently swallowed
             print(f"[DB Error] Could not save media {uid}: {e}")
+            raise  # propagate to batch handler
     return False
 
 @app.on_message(filters.channel)
@@ -657,15 +710,28 @@ async def make_immortal_cmd(client, message):
 @app.on_message(filters.command("batch") & filters.private)
 async def start_batch(client, message):
     if not is_authorized(message.from_user.id): return await message.reply("⛔ Unauthorized.")
+    # 🔥 Pre-flight: verify MongoDB is reachable before starting a potentially long batch
+    ok, err = await test_mongo_connection()
+    if not ok:
+        return await message.reply(
+            f"❌ **MongoDB Connection Failed!**\n\n"
+            f"`{err}`\n\n"
+            f"**Most likely causes:**\n"
+            f"1️⃣ Your server's IP is not whitelisted in MongoDB Atlas\n"
+            f"   → Go to Atlas → Network Access → Add `0.0.0.0/0`\n"
+            f"2️⃣ Wrong `MONGO_URI` environment variable\n"
+            f"3️⃣ MongoDB Atlas cluster is paused/sleeping"
+        )
     user_states[message.from_user.id] = {"state": "waiting_first_msg"}
-    await message.reply("Send or forward the **FIRST** message from your channel.")
+    await message.reply("✅ MongoDB connected.\nSend or forward the **FIRST** message from your channel.")
 
 @app.on_message(filters.private & ~filters.command([
     "start", "batch", "dbupload", "help",
     "addadmin", "deladmin",
     "adddb", "deldb",
     "getchannel", "url", "urls",
-    "renamechannel", "dedupe", "reassign", "makeimmortal"
+    "renamechannel", "dedupe", "reassign", "makeimmortal",
+    "dbstats"
 ]))
 async def handle_batch_messages(client, message):
     user_id = message.from_user.id
@@ -816,51 +882,65 @@ async def handle_batch_messages(client, message):
                         await status_msg.edit_text("❌ Unable to load channel peers.")
                         break
 
-                    try:
-                        forwarded_msgs = await client.forward_messages(
-                            chat_id=db_channel,
-                            from_chat_id=source_chat_id,
-                            message_ids=chunk,
-                            disable_notification=True,
+                    random_ids = [client.rnd_id() for _ in chunk]
+                    result = await client.invoke(
+                        raw.functions.messages.ForwardMessages(
+                            from_peer=await client.resolve_peer(source_chat_id),
+                            id=chunk,
+                            to_peer=await client.resolve_peer(db_channel),
+                            random_id=random_ids,
                             drop_author=True
                         )
-                        for msg in forwarded_msgs:
-                            if msg and msg.id:
-                                db_message_ids.append(msg.id)
-                                # 🔥 FIX: Save immortal file_id too so link is not tied to message IDs
-                                saved = await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
-                                if saved and msg.media:
-                                    mt = msg.media.value
-                                    if mt in ["document", "video", "audio", "photo", "animation"]:
-                                        media_obj = getattr(msg, mt)
-                                        immortal_files.append({"file_id": media_obj.file_id, "type": mt})
-                                        media_count += 1
-                    except Exception as e_forward:
-                        random_ids = [client.rnd_id() for _ in chunk]
-                        result = await client.invoke(
-                            raw.functions.messages.ForwardMessages(
-                                from_peer=await client.resolve_peer(source_chat_id),
-                                id=chunk,
-                                to_peer=await client.resolve_peer(db_channel),
-                                random_id=random_ids,
-                                drop_author=True
-                            )
-                        )
-                        raw_msg_ids = [u.message.id for u in result.updates if hasattr(u, "message") and hasattr(u.message, "id")]
-                        if raw_msg_ids:
-                            db_message_ids.extend(raw_msg_ids)
+                    )
+                    
+                    raw_msg_ids = []
+                    if hasattr(result, "updates"):
+                        for u in result.updates:
+                            if hasattr(u, "message") and hasattr(u.message, "id"):
+                                raw_msg_ids.append(u.message.id)
+                            elif hasattr(u, "id"):
+                                raw_msg_ids.append(u.id)
+                                
+                    if raw_msg_ids:
+                        db_message_ids.extend(raw_msg_ids)
+                        
+                        # Robust fetch with retry for FloodWait
+                        retries = 3
+                        raw_fetched = []
+                        while retries > 0:
                             try:
                                 raw_fetched = await client.get_messages(db_channel, raw_msg_ids)
-                                for msg in raw_fetched:
-                                    saved = await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
-                                    if saved and msg and msg.media:
-                                        mt = msg.media.value
-                                        if mt in ["document", "video", "audio", "photo", "animation"]:
-                                            media_obj = getattr(msg, mt)
-                                            immortal_files.append({"file_id": media_obj.file_id, "type": mt})
-                                            media_count += 1
-                            except Exception:
-                                pass
+                                break
+                            except FloodWait as fw:
+                                print(f"FloodWait in get_messages for DB channel: sleeping {fw.value}s")
+                                await asyncio.sleep(fw.value + 1)
+                                retries -= 1
+                            except Exception as e_fetch:
+                                print(f"Error fetching forwarded messages: {e_fetch}")
+                                break
+
+                        for msg in raw_fetched:
+                            if not msg or msg.empty: continue
+                            try:
+                                saved = await extract_and_save_media(msg, source_name=str(source_chat_id), source_title=source_chat_title)
+                            except Exception as db_err:
+                                await status_msg.edit_text(
+                                    f"❌ **MongoDB Write Failed — Batch Aborted!**\n\n"
+                                    f"`{db_err}`\n\n"
+                                    f"**Fix:** Go to MongoDB Atlas → Network Access\n"
+                                    f"and whitelist your server IP (or use `0.0.0.0/0`)."
+                                )
+                                if process_id in active_processes:
+                                    del active_processes[process_id]
+                                return
+                                
+                            if saved and msg.media:
+                                mt = msg.media.value
+                                if mt in ["document", "video", "audio", "photo", "animation"]:
+                                    media_obj = getattr(msg, mt)
+                                    if hasattr(media_obj, "file_id"):
+                                        immortal_files.append({"file_id": media_obj.file_id, "type": mt})
+                                        media_count += 1
 
                     processed_count += original_chunk_len
                     # 🔥 FIX: Progress bar is based on message-range position, capped at 100%
