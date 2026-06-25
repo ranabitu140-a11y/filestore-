@@ -1138,9 +1138,9 @@ async def deliver_content(client, message, url_hash, target_chat_id):
     is_channel = str(target_chat_id).startswith("-100")
 
     # ==========================================
-    # PATH A: ULTRA-FAST UPLOAD (Channels + Message_ids ONLY)
+    # PATH A: ULTRA-FAST UPLOAD (Standard DB Links ONLY)
     # ==========================================
-    if is_channel and not is_immortal:
+    if not is_immortal:
         chunk_size = 100
         for i in range(0, len(remaining_files), chunk_size):
             if active_processes.get(process_id):
